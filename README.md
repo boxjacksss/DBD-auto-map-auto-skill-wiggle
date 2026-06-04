@@ -74,17 +74,6 @@ assets/skill-check-debug
 
 The detector watches the outer ring by default, so the center prompt text such as `M5` is ignored. The white success zone must remain visible for the `White stable` time before it is armed, then the app sends one input when the red needle angle reaches that remembered white zone. It will not send another input until the ring clears. Use `Ring inner`, `Ring outer`, and `Angle tolerance` if the debug mask is not lining up with the skill-check circle.
 
-## Why This Version Should Not Lag
-
-The watch loop does not use Electron, Chromium, full-screen PNG conversion, or `node_modules`.
-
-It captures only the trigger box with `mss`, checks a small sample first, rejects obvious non-matches early, and only scans the full trigger crop if the sample looks close.
-
-OCR runs only after the trigger image disappears.
-
-## Map Images
-
-Put optional map images in:
 
 ```text
 assets/maps
