@@ -13,16 +13,13 @@ if errorlevel 1 (
   exit /b 1
 )
 
-python -c "import mss; import PIL" >nul 2>nul
+echo Checking Python dependencies...
+python -m pip install -r requirements.txt
 if errorlevel 1 (
-  echo Installing Python dependencies...
-  python -m pip install -r requirements.txt
-  if errorlevel 1 (
-    echo.
-    echo ERROR: Python dependency install failed.
-    pause
-    exit /b 1
-  )
+  echo.
+  echo ERROR: Python dependency install failed.
+  pause
+  exit /b 1
 )
 
 where tesseract >nul 2>nul

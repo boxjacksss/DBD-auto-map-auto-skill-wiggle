@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, Y, Button, Canvas, Entry, Frame, Label, Listbox, Scrollbar, Text, Tk, Toplevel, messagebox, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, Y, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Listbox, Scrollbar, Text, Tk, Toplevel, messagebox, ttk
 
 try:
     import mss
@@ -34,7 +34,9 @@ OCR_DEBUG_DIR = ASSET_DIR / "ocr-debug"
 SKILL_DEBUG_DIR = ASSET_DIR / "skill-check-debug"
 OCR_DEBUG_KEEP_SESSIONS = 8
 OCR_DEBUG_MAX_FRAMES_PER_SESSION = 240
-OCR_QUEUE_MAX = 24
+OCR_QUEUE_MAX = 3
+OCR_TESSERACT_TIMEOUT_SECONDS = 4
+_USER32 = None
 
 APPDATA = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
 CONFIG_DIR = APPDATA / "dbd-screen-ocr-detector"
@@ -66,15 +68,17 @@ DEFAULT_CONFIG = {
         "cooldownMs": 0,
         "pressKey": "c",
         "screenDebugOverlay": True,
-        "saveDebugImages": False,
+        "saveDebugImages": True,
         "whiteMin": 185,
         "whiteSpreadMax": 90,
         "redMin": 150,
         "redOtherMax": 150,
+        "greatOnly": True,
+        "greatHitTolerancePx": 2,
+        "greatLeadDegrees": 0,
+        "minGreatRedPixels": 2,
         "hitTolerancePx": 2,
         "angleToleranceDeg": 8,
-        "hitDepthPercent": 25,
-        "hitWindowEndPercent": 92,
         "minWhitePixels": 18,
         "minWhiteZonePixels": 24,
         "maxWhiteZoneRadialSpan": 14,
@@ -90,17 +94,6 @@ DEFAULT_CONFIG = {
         "whiteStableMs": 0,
         "ringInnerPercent": 72,
         "ringOuterPercent": 110,
-    },
-    "terrorRadius": {
-        "enabled": False,
-        "box": {"x": 840, "y": 390, "width": 240, "height": 240},
-        "scanMs": 50,
-        "radiusMeters": 32,
-        "redMin": 115,
-        "redDominance": 28,
-        "minRedPixels": 10,
-        "fullRedPercent": 8,
-        "pulseThreshold": 8,
     },
     "overlay": {
         "enabled": False,
@@ -303,7 +296,7 @@ def resolve_screen_box(box):
 
 def load_config():
     try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     except Exception:
         raw = {}
     cfg = deep_merge(DEFAULT_CONFIG, raw)
@@ -334,16 +327,22 @@ def load_config():
     skill["pressKey"] = str(skill_value("pressKey")).strip() or defaults["pressKey"]
     skill.pop("areaHotkey", None)
     skill.pop("testHotkey", None)
+    skill.pop("pressHoldMs", None)
+    skill.pop("targetAngleToleranceDeg", None)
     skill["screenDebugOverlay"] = bool(skill.get("screenDebugOverlay", defaults["screenDebugOverlay"]))
     skill["saveDebugImages"] = bool(skill.get("saveDebugImages", defaults["saveDebugImages"]))
     skill["whiteMin"] = max(120, min(255, int(float(skill_value("whiteMin")))))
     skill["whiteSpreadMax"] = max(10, min(160, int(float(skill_value("whiteSpreadMax")))))
     skill["redMin"] = max(80, min(255, int(float(skill_value("redMin")))))
     skill["redOtherMax"] = max(0, min(220, int(float(skill_value("redOtherMax")))))
+    skill["greatOnly"] = bool(skill.get("greatOnly", defaults["greatOnly"]))
+    skill["greatHitTolerancePx"] = max(2, min(6, int(float(skill_value("greatHitTolerancePx")))))
+    skill["greatLeadDegrees"] = max(0, min(30, int(float(skill_value("greatLeadDegrees")))))
+    skill["minGreatRedPixels"] = max(1, min(50, int(float(skill_value("minGreatRedPixels")))))
+    if int(skill["minGreatRedPixels"]) in (7, 10, 16):
+        skill["minGreatRedPixels"] = defaults["minGreatRedPixels"]
     skill["hitTolerancePx"] = max(0, min(20, int(float(skill_value("hitTolerancePx")))))
     skill["angleToleranceDeg"] = max(1, min(45, int(float(skill_value("angleToleranceDeg")))))
-    skill["hitDepthPercent"] = max(0, min(95, int(float(skill_value("hitDepthPercent")))))
-    skill["hitWindowEndPercent"] = max(skill["hitDepthPercent"], min(100, int(float(skill_value("hitWindowEndPercent")))))
     skill["minWhitePixels"] = max(1, min(200, int(float(skill_value("minWhitePixels")))))
     skill["minWhiteZonePixels"] = max(1, min(300, int(float(skill_value("minWhiteZonePixels")))))
     skill["maxWhiteZoneRadialSpan"] = max(1, min(80, int(float(skill_value("maxWhiteZoneRadialSpan")))))
@@ -360,29 +359,35 @@ def load_config():
     skill["ringInnerPercent"] = max(0, min(100, int(float(skill_value("ringInnerPercent")))))
     skill["ringOuterPercent"] = max(skill["ringInnerPercent"] + 1, min(120, int(float(skill_value("ringOuterPercent")))))
     cfg["skillCheck"] = skill
-    terror = cfg.get("terrorRadius") or {}
-    terror_defaults = DEFAULT_CONFIG["terrorRadius"]
-
-    def terror_value(key):
-        value = terror.get(key)
-        return terror_defaults[key] if value is None or value == "" else value
-
-    terror["box"] = clean_box(terror.get("box")) or terror_defaults["box"]
-    terror["enabled"] = bool(terror.get("enabled", terror_defaults["enabled"]))
-    terror["scanMs"] = max(25, min(1000, int(float(terror_value("scanMs")))))
-    terror["radiusMeters"] = max(8, min(80, int(float(terror_value("radiusMeters")))))
-    terror["redMin"] = max(40, min(255, int(float(terror_value("redMin")))))
-    terror["redDominance"] = max(0, min(160, int(float(terror_value("redDominance")))))
-    terror["minRedPixels"] = max(1, min(1000, int(float(terror_value("minRedPixels")))))
-    terror["fullRedPercent"] = max(1, min(80, int(float(terror_value("fullRedPercent")))))
-    terror["pulseThreshold"] = max(1, min(80, int(float(terror_value("pulseThreshold")))))
-    cfg["terrorRadius"] = terror
+    cfg.pop("terrorRadius", None)
     return cfg
 
 
-def save_config(cfg):
+def save_config(cfg, force_overlay=False):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    try:
+        existing = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        existing = {}
+    merged = deep_merge(existing, cfg)
+    for key in ("textBox", "imageTriggerBox"):
+        if not cfg.get(key) and existing.get(key):
+            merged[key] = existing[key]
+    if (
+        not force_overlay
+        and existing.get("overlay")
+        and cfg.get("overlay") == DEFAULT_CONFIG["overlay"]
+        and existing.get("overlay") != DEFAULT_CONFIG["overlay"]
+    ):
+        merged["overlay"] = existing["overlay"]
+    skill = merged.get("skillCheck")
+    if isinstance(skill, dict):
+        skill.pop("areaHotkey", None)
+        skill.pop("testHotkey", None)
+        skill.pop("pressHoldMs", None)
+        skill.pop("targetAngleToleranceDeg", None)
+    merged.pop("terrorRadius", None)
+    CONFIG_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
 
 def log_to_file(message):
@@ -760,7 +765,7 @@ def summarize_ocr_candidates(candidates):
 def windows_virtual_key(input_name):
     if os.name != "nt":
         raise RuntimeError("Keyboard input is only supported on Windows.")
-    import ctypes
+    user32 = windows_user32()
 
     value = str(input_name or "").strip().lower()
     named_keys = {
@@ -789,7 +794,7 @@ def windows_virtual_key(input_name):
     }
     vk = named_keys.get(value)
     if vk is None and len(value) == 1:
-        vk_scan = ctypes.windll.user32.VkKeyScanW(ord(value))
+        vk_scan = user32.VkKeyScanW(ord(value))
         if vk_scan == -1:
             raise RuntimeError(f"Unsupported key: {input_name}")
         vk = vk_scan & 0xFF
@@ -798,10 +803,20 @@ def windows_virtual_key(input_name):
     return vk
 
 
+def windows_user32():
+    if os.name != "nt":
+        raise RuntimeError("Windows input is only supported on Windows.")
+    global _USER32
+    if _USER32 is None:
+        import ctypes
+        _USER32 = ctypes.windll.user32
+    return _USER32
+
+
 def activate_windows_input(input_name):
     if os.name != "nt":
         raise RuntimeError("Auto input is only supported on Windows.")
-    import ctypes
+    user32 = windows_user32()
 
     value = str(input_name or "").strip().lower()
     mouse_inputs = {
@@ -831,14 +846,14 @@ def activate_windows_input(input_name):
     }
     if value in mouse_inputs:
         down, up, data = mouse_inputs[value]
-        ctypes.windll.user32.mouse_event(down, 0, 0, data, 0)
-        ctypes.windll.user32.mouse_event(up, 0, 0, data, 0)
+        user32.mouse_event(down, 0, 0, data, 0)
+        user32.mouse_event(up, 0, 0, data, 0)
         return
 
     vk = windows_virtual_key(value)
-    scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
-    ctypes.windll.user32.keybd_event(vk, scan, 0, 0)
-    ctypes.windll.user32.keybd_event(vk, scan, 0x0002, 0)
+    scan = user32.MapVirtualKeyW(vk, 0)
+    user32.keybd_event(vk, scan, 0, 0)
+    user32.keybd_event(vk, scan, 0x0002, 0)
 
 
 class SkillCheckDetector:
@@ -855,18 +870,22 @@ class SkillCheckDetector:
         self.white_hit_tolerance = None
         self.white_zones = []
         self.hit_zone_ids = set()
+        self.hit_zone_last_active_at = {}
+        self.hit_zone_last_press_at = {}
         self.white_candidate = set()
         self.white_angle_candidate = set()
         self.white_candidate_since = 0
+        self.current_red_angle = None
         self.last_debug_at = 0
+        self.last_event_debug_at = {}
         self.last_visual_emit_at = 0
         self.debug_capture_id = 0
         self.debug_location_logged = False
         self.geometry_cache_key = None
         self.geometry_cache = None
         self.last_red_angle = None
+        self.current_red_angle = None
         self.last_red_seen_at = 0
-        self.red_direction = 1
 
     def reset_skill_state(self):
         self.white_history = set()
@@ -876,6 +895,8 @@ class SkillCheckDetector:
         self.white_hit_tolerance = None
         self.white_zones = []
         self.hit_zone_ids = set()
+        self.hit_zone_last_active_at = {}
+        self.hit_zone_last_press_at = {}
         self.white_candidate = set()
         self.white_angle_candidate = set()
         self.white_candidate_since = 0
@@ -895,23 +916,10 @@ class SkillCheckDetector:
             previous = value
         return values
 
-    def angle_progress(self, zone, angle):
-        zone_min = float(zone.get("unwrappedMin", 0))
-        zone_max = float(zone.get("unwrappedMax", zone_min + 1))
-        span = max(1.0, zone_max - zone_min)
-        candidates = [angle - 720, angle - 360, angle, angle + 360, angle + 720]
-        value = min(
-            candidates,
-            key=lambda item: 0 if zone_min <= item <= zone_max else min(abs(item - zone_min), abs(item - zone_max)),
-        )
-        progress = (value - zone_min) / span
-        if self.red_direction < 0:
-            progress = 1 - progress
-        return progress
-
     def update_red_direction(self, red_ring_points):
         now = time.perf_counter()
         if not red_ring_points:
+            self.current_red_angle = None
             if self.last_red_seen_at and now - self.last_red_seen_at > 0.25:
                 self.last_red_angle = None
             return
@@ -920,17 +928,23 @@ class SkillCheckDetector:
         if not sin_total and not cos_total:
             return
         current = (math.degrees(math.atan2(sin_total, cos_total)) + 360) % 360
+        self.current_red_angle = current
         if self.last_red_seen_at and now - self.last_red_seen_at > 0.25:
             self.last_red_angle = None
-        if self.last_red_angle is not None:
-            delta = ((current - self.last_red_angle + 540) % 360) - 180
-            if 1 <= abs(delta) <= 90:
-                self.red_direction = 1 if delta > 0 else -1
         self.last_red_angle = current
         self.last_red_seen_at = now
 
     def log(self, message):
         self.emit(("log", message))
+
+    def zone_angle_distance(self, a, b):
+        return abs(((int(a) - int(b) + 180) % 360) - 180)
+
+    def matching_hit_zone_id(self, zone_id, tolerance=8):
+        for hit_id in self.hit_zone_ids:
+            if self.zone_angle_distance(zone_id, hit_id) <= tolerance:
+                return hit_id
+        return None
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -939,6 +953,7 @@ class SkillCheckDetector:
         self.last_press_at = 0
         self.reset_skill_state()
         self.last_debug_at = 0
+        self.last_event_debug_at = {}
         self.last_visual_emit_at = 0
         self.debug_capture_id = 0
         self.debug_location_logged = False
@@ -979,17 +994,36 @@ class SkillCheckDetector:
         radius_by_point = (self.geometry_cache or {}).get("radiusByPoint", {})
         min_zone_pixels = int(self.cfg["skillCheck"].get("minWhiteZonePixels", DEFAULT_CONFIG["skillCheck"]["minWhiteZonePixels"]))
         max_radial_span_setting = int(self.cfg["skillCheck"].get("maxWhiteZoneRadialSpan", DEFAULT_CONFIG["skillCheck"]["maxWhiteZoneRadialSpan"]))
+        great_tolerance = int(self.cfg["skillCheck"].get("greatHitTolerancePx", DEFAULT_CONFIG["skillCheck"]["greatHitTolerancePx"]))
+        great_tolerance = max(2, min(6, great_tolerance))
+        great_lead_degrees = int(self.cfg["skillCheck"].get("greatLeadDegrees", DEFAULT_CONFIG["skillCheck"]["greatLeadDegrees"]))
         max_radial_span = max(max_radial_span_setting, min(width, height) * 0.09)
-        for zone_id, run in enumerate(self.contiguous_angle_runs(self.white_angle_history)):
+        for run in self.contiguous_angle_runs(self.white_angle_history):
             zone_angles = set(run)
             unwrapped_run = self.unwrap_angle_run(run)
             unwrapped_min = min(unwrapped_run) if unwrapped_run else 0
             unwrapped_max = max(unwrapped_run) if unwrapped_run else unwrapped_min
+            zone_center = ((unwrapped_min + unwrapped_max) / 2) % 360
+            zone_id = int(round(zone_center)) % 360
             zone_hit_angles = set()
+            zone_lead_angles = set()
             for angle in zone_angles:
                 for delta in range(-angle_tolerance, angle_tolerance + 1):
                     zone_hit_angles.add((angle + delta) % 360)
+                for delta in range(-great_lead_degrees, great_lead_degrees + 1):
+                    zone_lead_angles.add((angle + delta) % 360)
             zone_points = {point for point in self.white_history if angle_by_point.get(point) in zone_angles}
+            interior_angles = set()
+            span = max(1, unwrapped_max - unwrapped_min)
+            edge_inset = 0 if span <= 8 else max(1, min(7, int(round(span * 0.20))))
+            for angle in zone_angles:
+                candidates = [angle - 360, angle, angle + 360]
+                value = min(candidates, key=lambda item: abs(item - ((unwrapped_min + unwrapped_max) / 2)))
+                progress = (value - unwrapped_min) / span
+                if edge_inset == 0 or edge_inset <= (value - unwrapped_min) <= span - edge_inset:
+                    interior_angles.add(angle % 360)
+            if not interior_angles:
+                interior_angles = set(zone_angles)
             zone_mask = set()
             for x, y in zone_points:
                 for dy in range(-tolerance, tolerance + 1):
@@ -1011,16 +1045,57 @@ class SkillCheckDetector:
                 radius = radius_by_point.get((xx, yy))
                 if radius is not None and abs(radius - radial_mid) <= middle_half_span + tolerance:
                     middle_mask.add((xx, yy))
+            great_mask = set()
+            great_core_mask = set()
+            interior_mask = set()
+            radial_edge_inset = 1 if radial_span >= 4 else 0
+            interior_radial_min = radial_min + radial_edge_inset
+            interior_radial_max = radial_max - radial_edge_inset
+            if interior_radial_min > interior_radial_max:
+                interior_radial_min = radial_min
+                interior_radial_max = radial_max
+            for x, y in zone_points:
+                point_angle = angle_by_point.get((x, y))
+                if point_angle in interior_angles:
+                    great_core_mask.add((x, y))
+                for dy in range(-great_tolerance, great_tolerance + 1):
+                    yy = y + dy
+                    if yy < 0 or yy >= height:
+                        continue
+                    for dx in range(-great_tolerance, great_tolerance + 1):
+                        xx = x + dx
+                        if 0 <= xx < width:
+                            radius = radius_by_point.get((xx, yy))
+                            if radius is not None and radial_min - great_tolerance <= radius <= radial_max + great_tolerance:
+                                great_mask.add((xx, yy))
+                            if point_angle in interior_angles and abs(dx) <= 1 and abs(dy) <= 1:
+                                radius = radius_by_point.get((xx, yy))
+                                if radius is not None and interior_radial_min <= radius <= interior_radial_max:
+                                    great_core_mask.add((xx, yy))
+            for (xx, yy), point_angle in angle_by_point.items():
+                if point_angle not in interior_angles:
+                    continue
+                radius = radius_by_point.get((xx, yy))
+                if radius is not None and interior_radial_min <= radius <= interior_radial_max:
+                    interior_mask.add((xx, yy))
             if len(zone_points) >= min_zone_pixels and radial_span <= max_radial_span:
                 self.white_zones.append({
                     "id": zone_id,
+                    "centerAngle": zone_center,
                     "angles": zone_angles,
                     "hitAngles": zone_hit_angles,
+                    "leadAngles": zone_lead_angles,
+                    "interiorAngles": interior_angles,
                     "points": zone_points,
                     "mask": zone_mask,
                     "middleMask": middle_mask,
+                    "greatMask": great_mask,
+                    "greatCoreMask": great_core_mask,
+                    "interiorMask": interior_mask,
                     "radialMin": radial_min,
                     "radialMax": radial_max,
+                    "interiorRadialMin": interior_radial_min,
+                    "interiorRadialMax": interior_radial_max,
                     "radialMid": radial_mid,
                     "radialSpan": radial_span,
                     "middleHalfSpan": middle_half_span,
@@ -1039,6 +1114,8 @@ class SkillCheckDetector:
                         self.white_hit_mask.add((xx, yy))
         if reset_hits:
             self.hit_zone_ids = set()
+            self.hit_zone_last_active_at = {}
+            self.hit_zone_last_press_at = {}
 
     def contiguous_angle_runs(self, angles, max_gap=None):
         if not angles:
@@ -1121,8 +1198,8 @@ class SkillCheckDetector:
         min_center_prompt_pixels = int(cfg["minCenterPromptPixels"])
         max_center_prompt_pixels = int(cfg["maxCenterPromptPixels"])
         min_red = int(cfg["minRedPixels"])
-        hit_depth = int(cfg.get("hitDepthPercent", DEFAULT_CONFIG["skillCheck"]["hitDepthPercent"])) / 100
-        hit_window_end = int(cfg.get("hitWindowEndPercent", DEFAULT_CONFIG["skillCheck"]["hitWindowEndPercent"])) / 100
+        great_only = bool(cfg.get("greatOnly", DEFAULT_CONFIG["skillCheck"]["greatOnly"]))
+        min_great_red = int(cfg.get("minGreatRedPixels", DEFAULT_CONFIG["skillCheck"]["minGreatRedPixels"]))
         white_stable_seconds = int(cfg["whiteStableMs"]) / 1000
         now = time.perf_counter()
         geometry = self.skill_geometry(width, height, cfg)
@@ -1170,7 +1247,7 @@ class SkillCheckDetector:
         ring_outline_too_full = ring_outline_pixel_percent > max_ring_outline_percent
         if center_prompt_count < min_center_prompt_pixels or center_prompt_too_large or len(ring_outline_angles) < min_ring_outline_bins or ring_outline_too_full:
             self.reset_skill_state()
-            return False, 0, 0, set(), [], red_all_points, None, 0, 0
+            return False, 0, 0, set(), [], [], None, 0, 0
 
         white_angle_counts = {}
         ring_angles_by_point = geometry["angleByPoint"]
@@ -1195,11 +1272,19 @@ class SkillCheckDetector:
                 white_angle_bins = set()
         white_zone_points = {point for point in white_points if ring_angles_by_point[point] in white_angle_bins}
 
-        if len(white_zone_points) >= min_white and white_angle_bins and len(self.white_history) < min_white:
+        can_learn_white = not red_ring_points or len(self.white_history) < min_white or not self.white_zones
+        if red_ring_points and self.white_angle_history and white_angle_bins:
+            overlap = len(white_angle_bins & self.white_angle_history)
+            smaller = max(1, min(len(white_angle_bins), len(self.white_angle_history)))
+            if overlap / smaller < 0.25:
+                can_learn_white = True
+        if len(white_zone_points) >= min_white and white_angle_bins and can_learn_white:
+            candidate_changed = False
             if not self.white_candidate:
                 self.white_candidate = white_zone_points
                 self.white_angle_candidate = white_angle_bins
                 self.white_candidate_since = now
+                candidate_changed = True
             else:
                 overlap = len(white_angle_bins & self.white_angle_candidate)
                 smaller = max(1, min(len(white_angle_bins), len(self.white_angle_candidate)))
@@ -1207,11 +1292,13 @@ class SkillCheckDetector:
                     self.white_candidate = white_zone_points
                     self.white_angle_candidate = white_angle_bins
                     self.white_candidate_since = now
+                    candidate_changed = True
                 else:
                     self.white_candidate = white_zone_points
                     self.white_angle_candidate = white_angle_bins
             if now - self.white_candidate_since >= white_stable_seconds:
-                self.set_learned_white_zone(self.white_candidate, self.white_angle_candidate, width, height, hit_tolerance)
+                reset_hits = candidate_changed or len(self.white_history) < min_white
+                self.set_learned_white_zone(self.white_candidate, self.white_angle_candidate, width, height, hit_tolerance, reset_hits=reset_hits)
         elif not red_all_points:
             self.reset_skill_state()
 
@@ -1226,33 +1313,84 @@ class SkillCheckDetector:
         hit_zone_id = None
         best_zone_count = 0
         active_zone_counts = {}
+        active_zone_angle_counts = {}
         active_zone_points = {}
         for x, y, red_angle in red_ring_points:
             for zone in self.white_zones:
-                red_is_on_white = (x, y) in zone["middleMask"]
-                red_is_in_white_angle = red_angle in zone["hitAngles"]
-                red_progress = self.angle_progress(zone, red_angle)
-                red_is_in_hit_window = hit_depth <= red_progress <= hit_window_end
-                if red_is_on_white and red_is_in_white_angle and red_is_in_hit_window:
+                if great_only:
+                    red_radius = geometry["radiusByPoint"].get((x, y))
+                    red_is_in_white_angle = red_angle in zone.get("interiorAngles", zone["hitAngles"])
+                    red_is_in_marker_interior = (
+                        red_radius is not None
+                        and zone.get("interiorRadialMin", zone["radialMin"]) <= red_radius <= zone.get("interiorRadialMax", zone["radialMax"])
+                    )
+                    red_is_on_white = red_is_in_white_angle and red_is_in_marker_interior
+                else:
+                    red_is_on_white = (x, y) in zone["middleMask"]
+                    red_is_in_white_angle = red_angle in zone["hitAngles"]
+                    red_is_in_marker_interior = True
+                if red_is_on_white and red_is_in_white_angle and red_is_in_marker_interior:
                     zone_id = zone["id"]
                     active_zone_counts[zone_id] = active_zone_counts.get(zone_id, 0) + 1
+                    active_zone_angle_counts.setdefault(zone_id, {})
+                    active_zone_angle_counts[zone_id][red_angle] = active_zone_angle_counts[zone_id].get(red_angle, 0) + 1
                     active_zone_points.setdefault(zone_id, []).append((x, y))
                     break
 
-        active_zone_ids = {zone_id for zone_id, count in active_zone_counts.items() if count >= min_red}
-        for zone_id in list(self.hit_zone_ids):
-            if zone_id not in active_zone_ids:
-                self.hit_zone_ids.discard(zone_id)
+        required_red = min_great_red if great_only else min_red
+        required_angle_red = max(2, min(5, required_red // 3)) if great_only else 1
 
-        for zone_id, count in active_zone_counts.items():
-            if zone_id in self.hit_zone_ids:
+        def strongest_angle_cluster(angle_counts):
+            if not angle_counts:
+                return 0
+            strongest = 0
+            for angle in angle_counts:
+                total = 0
+                for delta in (-1, 0, 1):
+                    total += angle_counts.get((angle + delta) % 360, 0)
+                strongest = max(strongest, total)
+            return strongest
+
+        active_zone_ids = {
+            zone_id
+            for zone_id, count in active_zone_counts.items()
+            if count >= required_red
+            and (not great_only or strongest_angle_cluster(active_zone_angle_counts.get(zone_id, {})) >= required_angle_red)
+        }
+        red_zone_points = []
+        for zone_id in active_zone_ids:
+            red_zone_points.extend(active_zone_points.get(zone_id, []))
+        for zone_id in active_zone_ids:
+            self.hit_zone_last_active_at[zone_id] = now
+        rearm_seconds = 0.015
+        rearm_angle = 8
+        min_zone_repress_seconds = 0.045
+        current_red_angle = self.current_red_angle
+        for zone_id in list(self.hit_zone_ids):
+            still_active = any(self.zone_angle_distance(zone_id, active_id) <= 8 for active_id in active_zone_ids)
+            if still_active:
+                self.hit_zone_last_active_at[zone_id] = now
                 continue
+            red_moved_away = (
+                current_red_angle is not None
+                and self.zone_angle_distance(zone_id, current_red_angle) >= rearm_angle
+            )
+            red_disappeared = current_red_angle is None and now - float(self.hit_zone_last_active_at.get(zone_id, 0)) >= 0.04
+            if red_moved_away or (red_disappeared and now - float(self.hit_zone_last_active_at.get(zone_id, 0)) >= rearm_seconds):
+                self.hit_zone_ids.discard(zone_id)
+                self.hit_zone_last_active_at.pop(zone_id, None)
+
+        for zone_id in active_zone_ids:
+            if self.matching_hit_zone_id(zone_id) is not None:
+                continue
+            last_zone_press_at = float(self.hit_zone_last_press_at.get(zone_id, 0))
+            if now - last_zone_press_at < min_zone_repress_seconds:
+                continue
+            count = active_zone_counts.get(zone_id, 0)
             if count > best_zone_count:
                 best_zone_count = count
                 hit_zone_id = zone_id
-        if hit_zone_id is not None:
-            red_zone_points = active_zone_points.get(hit_zone_id, [])
-        hit = hit_zone_id is not None and best_zone_count >= min_red
+        hit = hit_zone_id is not None and best_zone_count >= required_red
         return hit, len(white_zone_points), len(red_zone_points), white_zone_points, red_zone_points, red_all_points, hit_zone_id, len(self.white_zones), len(self.hit_zone_ids)
 
     def build_highlight_preview(self, rgb, width, height, white_points, red_zone_points, red_all_points):
@@ -1260,16 +1398,28 @@ class SkillCheckDetector:
         overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
+        def outline(points, color, radius=0):
+            points = set(points)
+            for x, y in points:
+                if (
+                    (x - 1, y) not in points
+                    or (x + 1, y) not in points
+                    or (x, y - 1) not in points
+                    or (x, y + 1) not in points
+                ):
+                    draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=color)
+
         def mark(points, color, radius):
             for x, y in points:
                 draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=color)
 
-        middle_points = set()
+        good_points = set()
+        great_points = set()
         for zone in self.white_zones:
-            middle_points.update(zone.get("middleMask", set()))
-        mark(self.white_history, (64, 220, 255, 90), 1)
-        mark(middle_points, (64, 255, 220, 170), 1)
-        mark(white_points, (255, 255, 255, 190), 1)
+            good_points.update(zone.get("mask", set()))
+            great_points.update(zone.get("interiorMask", set()))
+        outline(good_points, (30, 220, 255, 230), 0)
+        outline(great_points, (255, 245, 70, 245), 0)
         mark(red_all_points, (255, 160, 0, 155), 1)
         mark(red_zone_points, (255, 0, 0, 235), 2)
         return Image.alpha_composite(image, overlay).convert("RGB").tobytes()
@@ -1278,25 +1428,31 @@ class SkillCheckDetector:
         overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
+        def outline(points, color, radius=0):
+            points = set(points)
+            for x, y in points:
+                if (
+                    (x - 1, y) not in points
+                    or (x + 1, y) not in points
+                    or (x, y - 1) not in points
+                    or (x, y + 1) not in points
+                ):
+                    draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=color)
+
         def mark(points, color, radius):
             for x, y in points:
                 draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=color)
 
-        radius_by_point = (self.geometry_cache or {}).get("radiusByPoint", {})
-        boundary_points = set()
+        good_points = set()
+        great_points = set()
         for zone in self.white_zones:
-            mid = float(zone.get("radialMid") or 0)
-            half = float(zone.get("middleHalfSpan") or 1.5)
-            for point in zone.get("middleMask", set()):
-                radius = radius_by_point.get(point)
-                if radius is None:
-                    continue
-                if abs(abs(radius - mid) - half) <= 0.75:
-                    boundary_points.add(point)
+            good_points.update(zone.get("mask", set()))
+            great_points.update(zone.get("interiorMask", set()))
 
         # Sparse, high-saturation non-white/non-red colors avoid feeding back into
         # detection if Windows includes the overlay in screen capture.
-        mark(boundary_points, (45, 255, 220, 190), 0)
+        outline(good_points, (30, 220, 255, 210), 0)
+        outline(great_points, (255, 245, 70, 230), 0)
         mark(red_zone_points, (255, 0, 255, 230), 1)
         return overlay.tobytes()
 
@@ -1310,39 +1466,69 @@ class SkillCheckDetector:
             return
         now = time.time()
         min_white = int(self.cfg["skillCheck"]["minWhitePixels"])
-        if not hit and len(white_points) < min_white:
+        white_seen = len(white_points) >= min_white
+        red_seen = bool(red_all_points)
+        red_in_zone = bool(red_zone_points)
+        if not (hit or white_seen or red_seen or red_in_zone):
             return
-        if not hit and now - self.last_debug_at < 0.1:
+        if hit:
+            event_name = "hit"
+        elif red_in_zone:
+            event_name = "red-in-zone"
+        elif red_seen:
+            event_name = "red-visible"
+        else:
+            event_name = "white-visible"
+        should_archive = hit or red_in_zone
+        min_gap = 0.0 if hit else 0.035 if red_in_zone else 0.20 if red_seen else 0.35
+        last_event_at = float(self.last_event_debug_at.get(event_name, 0))
+        if not hit and now - last_event_at < min_gap:
             return
+        self.last_event_debug_at[event_name] = now
         self.last_debug_at = now
         self.debug_capture_id += 1
         SKILL_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         raw_image = Image.frombytes("RGB", (width, height), rgb)
         mask = Image.new("RGB", (width, height), "#05070a")
-        mask_pixels = mask.load()
-        for x, y in self.white_history:
-            if 0 <= x < width and 0 <= y < height:
-                mask_pixels[x, y] = (30, 120, 150)
+        draw = ImageDraw.Draw(mask)
+
+        def outline(points, color):
+            points = set(points)
+            for x, y in points:
+                if (
+                    (x - 1, y) not in points
+                    or (x + 1, y) not in points
+                    or (x, y - 1) not in points
+                    or (x, y + 1) not in points
+                ):
+                    draw.point((x, y), fill=color)
+
+        def mark(points, color, radius=0):
+            for x, y in points:
+                if radius:
+                    draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=color)
+                else:
+                    draw.point((x, y), fill=color)
+
         for zone in self.white_zones:
-            for x, y in zone.get("middleMask", set()):
-                if 0 <= x < width and 0 <= y < height:
-                    mask_pixels[x, y] = (80, 255, 220)
-        for x, y in white_points:
-            mask_pixels[x, y] = (255, 255, 255)
-        for x, y in red_all_points:
-            mask_pixels[x, y] = (255, 160, 0)
-        for x, y in red_zone_points:
-            mask_pixels[x, y] = (255, 0, 0)
+            outline(zone.get("mask", set()), (30, 220, 255))
+            outline(zone.get("interiorMask", set()), (255, 245, 70))
+        mark(red_all_points, (255, 160, 0), 1)
+        mark(red_zone_points, (255, 0, 255), 2)
 
         latest_raw = SKILL_DEBUG_DIR / "latest-raw.png"
         latest_mask = SKILL_DEBUG_DIR / "latest-mask.png"
         self.save_image_atomic(raw_image, latest_raw)
         self.save_image_atomic(mask, latest_mask)
-        if hit:
-            millis = int((now % 1) * 1000)
-            stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{millis:03d}"
-            self.save_image_atomic(raw_image, SKILL_DEBUG_DIR / f"{stamp}-hit-raw.png")
-            self.save_image_atomic(mask, SKILL_DEBUG_DIR / f"{stamp}-hit-mask.png")
+        if not should_archive:
+            if not self.debug_location_logged:
+                self.debug_location_logged = True
+                self.log(f"Skill check debug images: {SKILL_DEBUG_DIR}")
+            return
+        millis = int((now % 1) * 1000)
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{millis:03d}-{self.debug_capture_id:05d}-{event_name}"
+        self.save_image_atomic(raw_image, SKILL_DEBUG_DIR / f"{stamp}-raw.png")
+        self.save_image_atomic(mask, SKILL_DEBUG_DIR / f"{stamp}-mask.png")
         if not self.debug_location_logged:
             self.debug_location_logged = True
             self.log(f"Skill check debug images: {SKILL_DEBUG_DIR}")
@@ -1365,15 +1551,18 @@ class SkillCheckDetector:
                         activate_windows_input(cfg.get("pressKey") or "c")
                         self.last_press_at = time.time()
                         self.hit_zone_ids.add(hit_zone_id)
+                        self.hit_zone_last_press_at[hit_zone_id] = time.perf_counter()
                         hit_zone_count = len(self.hit_zone_ids)
-                        self.emit(("skill-hit", f"Pressed {cfg.get('pressKey') or 'c'} ({hit_zone_count}/{zone_count} zones)"))
+                        self.emit(("skill-hit", f"Pressed {cfg.get('pressKey') or 'c'} at marker {hit_zone_id}; markers visible {zone_count}"))
                     self.save_debug_images(rgb, width, height, white_points, red_zone_points, red_all_points, can_press)
                     emit_visual = can_press or time.perf_counter() - self.last_visual_emit_at >= 0.075
                     if emit_visual:
                         self.last_visual_emit_at = time.perf_counter()
                         armed = len(self.white_history) >= int(cfg["minWhitePixels"])
                         preview_rgb = self.build_highlight_preview(rgb, width, height, white_points, red_zone_points, red_all_points)
-                        screen_overlay = self.build_screen_debug_overlay(width, height, white_points, red_zone_points, red_all_points)
+                        screen_overlay = None
+                        if cfg.get("screenDebugOverlay"):
+                            screen_overlay = self.build_screen_debug_overlay(width, height, white_points, red_zone_points, red_all_points)
                         overlay_box = resolve_screen_box(box) or box
                         self.emit(("skill-visual", {
                             "armed": armed,
@@ -1391,12 +1580,12 @@ class SkillCheckDetector:
                             "width": width,
                             "height": height,
                         }))
-                        self.emit(("skill-score", f"white now {white_count}, remembered {len(self.white_history)}, zones {hit_zone_count}/{zone_count}, red in white {red_count}, red total {len(red_all_points) if armed else 0}"))
+                        self.emit(("skill-score", f"markers {zone_count}, red inside target {red_count}, red total {len(red_all_points) if armed else 0}"))
                         if hit and not can_press:
                             self.emit(("skill-state", "NOW: red in a learned white zone that was already pressed."))
                         else:
                             if armed:
-                                self.emit(("skill-state", f"NOW: white learned; waiting for red inside it ({hit_zone_count}/{zone_count} zones hit)."))
+                                self.emit(("skill-state", f"NOW: found {zone_count} marker{'s' if zone_count != 1 else ''}; waiting for red inside target."))
                             else:
                                 self.emit(("skill-state", "NOW: looking for white success zone."))
                     scan_ms = int(cfg["scanMs"])
@@ -1405,323 +1594,6 @@ class SkillCheckDetector:
                 except Exception as exc:
                     self.emit(("skill-state", str(exc)))
                     self.log(f"Skill check error: {exc}")
-                    self.stop_event.wait(1)
-
-
-class TerrorRadiusDetector:
-    def __init__(self, cfg, emit):
-        self.cfg = cfg
-        self.emit = emit
-        self.stop_event = threading.Event()
-        self.thread = None
-        self.smoothed_strength = 0.0
-        self.last_strength = 0.0
-        self.last_peak_at = 0.0
-        self.beat_times = []
-        self.heart_center = None
-        self.heart_center_full = None
-        self.frame_index = 0
-        self.last_visual_emit_at = 0.0
-        self.last_score_emit_at = 0.0
-
-    def log(self, message):
-        self.emit(("log", message))
-
-    def reset_state(self):
-        self.smoothed_strength = 0.0
-        self.last_strength = 0.0
-        self.last_peak_at = 0.0
-        self.beat_times = []
-        self.heart_center = None
-        self.heart_center_full = None
-        self.frame_index = 0
-        self.last_visual_emit_at = 0.0
-        self.last_score_emit_at = 0.0
-
-    def start(self):
-        if self.thread and self.thread.is_alive():
-            return
-        self.stop_event.clear()
-        self.reset_state()
-        self.thread = threading.Thread(target=self.run, daemon=True)
-        self.thread.start()
-        self.log("Terror radius watcher started. It captures only the selected visual-heart area.")
-
-    def stop(self):
-        self.stop_event.set()
-        self.reset_state()
-        self.log("Terror radius watcher stopped.")
-
-    def capture_box(self, sct, box):
-        box = resolve_screen_box(box)
-        if not box:
-            raise RuntimeError("Selected terror-radius area is not valid.")
-        region = {
-            "left": int(box["x"]),
-            "top": int(box["y"]),
-            "width": int(box["width"]),
-            "height": int(box["height"]),
-        }
-        shot = sct.grab(region)
-        return shot.rgb, shot.width, shot.height, 0, 0
-
-    def scan_red_candidates(self, rgb, width, height, roi=None, step=1):
-        cfg = self.cfg["terrorRadius"]
-        red_min = int(cfg["redMin"])
-        red_dominance = int(cfg["redDominance"])
-        if roi:
-            start_x, start_y, end_x, end_y = roi
-            start_x = max(0, min(width - 1, int(start_x)))
-            start_y = max(0, min(height - 1, int(start_y)))
-            end_x = max(start_x + 1, min(width, int(end_x)))
-            end_y = max(start_y + 1, min(height, int(end_y)))
-        else:
-            start_x, start_y, end_x, end_y = 0, 0, width, height
-
-        candidates = []
-        score_total = 0.0
-        sx = 0.0
-        sy = 0.0
-        for y in range(start_y, end_y, step):
-            row = y * width * 3
-            for x in range(start_x, end_x, step):
-                i = row + x * 3
-                r, g, b = rgb[i], rgb[i + 1], rgb[i + 2]
-                dominance = r - max(g, b)
-                if r >= red_min and dominance >= red_dominance:
-                    score = (dominance / 255) * (r / 255)
-                    candidates.append((x, y, score))
-                    score_total += score
-                    sx += x * score
-                    sy += y * score
-
-        if not candidates:
-            return [], 0.0, None
-        total = max(0.001, score_total)
-        return candidates, score_total, (sx / total, sy / total)
-
-    def estimate_heart_center(self, candidates, width, height):
-        if not candidates:
-            return None
-        bin_size = max(6, int(min(width, height) * 0.045))
-        bins = {}
-        for x, y, score in candidates:
-            key = (int(x // bin_size), int(y // bin_size))
-            bins[key] = bins.get(key, 0.0) + score
-        best_key = max(bins, key=bins.get)
-        seed_x = (best_key[0] + 0.5) * bin_size
-        seed_y = (best_key[1] + 0.5) * bin_size
-        core_radius = max(10, min(width, height) * 0.16)
-        sx = sy = total = 0.0
-        for x, y, score in candidates:
-            if (x - seed_x) ** 2 + (y - seed_y) ** 2 <= core_radius ** 2:
-                sx += x * score
-                sy += y * score
-                total += score
-        if total <= 0:
-            return seed_x, seed_y
-        return sx / total, sy / total
-
-    def analyze(self, rgb, width, height, offset_x=0, offset_y=0):
-        cfg = self.cfg["terrorRadius"]
-        min_red = int(cfg["minRedPixels"])
-        full_red_fraction = max(0.01, int(cfg["fullRedPercent"]) / 100)
-        pulse_threshold = int(cfg["pulseThreshold"]) / 100
-        radius_meters = int(cfg["radiusMeters"])
-        min_dim = max(1, min(width, height))
-        area = max(1, width * height)
-
-        self.frame_index += 1
-        if self.heart_center_full:
-            local_x = self.heart_center_full[0] - offset_x
-            local_y = self.heart_center_full[1] - offset_y
-            if 0 <= local_x < width and 0 <= local_y < height:
-                self.heart_center = (local_x, local_y)
-            elif self.frame_index % 10 == 0:
-                self.heart_center = None
-
-        use_full_scan = self.heart_center is None or self.frame_index % 10 == 0
-        scan_step = 2 if area > 50000 else 1
-        roi = None
-        if not use_full_scan and self.heart_center:
-            cx, cy = self.heart_center
-            follow_radius = max(48, min_dim * 0.42)
-            roi = (cx - follow_radius, cy - follow_radius, cx + follow_radius, cy + follow_radius)
-
-        candidates, red_score_total, weighted_center = self.scan_red_candidates(rgb, width, height, roi=roi, step=1)
-        if len(candidates) < min_red and roi:
-            candidates, red_score_total, weighted_center = self.scan_red_candidates(rgb, width, height, step=scan_step)
-
-        red_count = len(candidates)
-        estimated_center = self.estimate_heart_center(candidates, width, height) or weighted_center
-        if estimated_center:
-            if self.heart_center:
-                old_x, old_y = self.heart_center
-                self.heart_center = (old_x * 0.62 + estimated_center[0] * 0.38, old_y * 0.62 + estimated_center[1] * 0.38)
-            else:
-                self.heart_center = estimated_center
-            self.heart_center_full = (offset_x + self.heart_center[0], offset_y + self.heart_center[1])
-
-        heart_seen = red_count >= min_red and self.heart_center is not None
-        core_radius = max(9, min_dim * 0.15)
-        string_outer_radius = max(core_radius + 12, min_dim * 0.46)
-        string_points = []
-        heart_points = []
-        string_score_total = 0.0
-        if heart_seen:
-            cx, cy = self.heart_center
-            core_sq = core_radius ** 2
-            outer_sq = string_outer_radius ** 2
-            for x, y, score in candidates:
-                dist_sq = (x - cx) ** 2 + (y - cy) ** 2
-                if dist_sq <= core_sq:
-                    heart_points.append((x, y))
-                elif dist_sq <= outer_sq:
-                    string_points.append((x, y))
-                    string_score_total += score
-
-        string_count = len(string_points)
-        raw_strength = 0.0
-        strings_seen = heart_seen and string_count >= min_red
-        if strings_seen:
-            average_string_score = string_score_total / string_count if string_count else 0.0
-            string_target = max(min_red * 5, int(min_dim * max(0.35, full_red_fraction * 4)))
-            coverage_strength = min(1.0, string_count / string_target)
-            color_strength = min(1.0, average_string_score / 0.55)
-            raw_strength = (coverage_strength * 0.7) + (color_strength * 0.3)
-
-        alpha = 0.42 if raw_strength >= self.smoothed_strength else 0.24
-        self.smoothed_strength = (self.smoothed_strength * (1 - alpha)) + (raw_strength * alpha)
-        if not strings_seen and self.smoothed_strength < 0.03:
-            self.smoothed_strength = 0.0
-
-        now = time.perf_counter()
-        beat = False
-        if strings_seen and self.smoothed_strength >= pulse_threshold:
-            rising = self.smoothed_strength - self.last_strength
-            if rising >= max(0.02, pulse_threshold * 0.25) and now - self.last_peak_at >= 0.24:
-                beat = True
-                self.last_peak_at = now
-                self.beat_times.append(now)
-                self.beat_times = self.beat_times[-8:]
-        self.last_strength = self.smoothed_strength
-
-        bpm = 0
-        if len(self.beat_times) >= 2:
-            intervals = [b - a for a, b in zip(self.beat_times, self.beat_times[1:]) if b > a]
-            if intervals:
-                bpm = int(round(60 / (sum(intervals) / len(intervals))))
-
-        normalized = max(0.0, min(1.0, self.smoothed_strength))
-        estimated_distance = radius_meters * (1 - normalized) if strings_seen else None
-        if not heart_seen:
-            layer = "Outside"
-            distance_label = f">{radius_meters}m or hidden"
-        elif not strings_seen:
-            layer = "Heart"
-            distance_label = "watching strings"
-        elif normalized < 0.34:
-            layer = "Far"
-            distance_label = f"{int(round(radius_meters * 2 / 3))}-{radius_meters}m"
-        elif normalized < 0.67:
-            layer = "Near"
-            distance_label = f"{int(round(radius_meters / 3))}-{int(round(radius_meters * 2 / 3))}m"
-        else:
-            layer = "Close"
-            distance_label = f"0-{int(round(radius_meters / 3))}m"
-
-        return {
-            "detected": heart_seen,
-            "stringsSeen": strings_seen,
-            "beat": beat,
-            "redCount": red_count,
-            "heartCount": len(heart_points),
-            "stringCount": string_count,
-            "rawStrength": raw_strength,
-            "strength": normalized,
-            "bpm": bpm,
-            "layer": layer,
-            "radiusMeters": radius_meters,
-            "estimatedDistance": estimated_distance,
-            "distanceLabel": distance_label,
-            "heartCenter": self.heart_center,
-            "heartPoints": heart_points,
-            "stringPoints": string_points,
-        }
-
-    def build_preview(self, rgb, width, height, heart_center, heart_points, string_points):
-        image = Image.frombytes("RGB", (width, height), rgb).convert("RGBA")
-        overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        for x, y in heart_points:
-            draw.point((x, y), fill=(255, 210, 60, 180))
-        for x, y in string_points:
-            draw.rectangle((x - 1, y - 1, x + 1, y + 1), fill=(255, 35, 35, 210))
-        if heart_center:
-            cx, cy = heart_center
-            radius = max(6, min(width, height) * 0.15)
-            draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=(255, 210, 60, 220), width=2)
-        return Image.alpha_composite(image, overlay).convert("RGB").tobytes()
-
-    def run(self):
-        with mss.MSS() as sct:
-            while not self.stop_event.is_set():
-                try:
-                    cfg = self.cfg["terrorRadius"]
-                    box = cfg.get("box")
-                    if not box:
-                        self.emit(("terror-state", "No terror-radius area set."))
-                        self.stop_event.wait(0.5)
-                        continue
-
-                    rgb, width, height, offset_x, offset_y = self.capture_box(sct, box)
-                    result = self.analyze(rgb, width, height, offset_x, offset_y)
-                    now = time.perf_counter()
-                    include_preview = result["beat"] or now - self.last_visual_emit_at >= 0.12
-                    if include_preview:
-                        self.last_visual_emit_at = now
-                        preview_rgb = self.build_preview(
-                            rgb,
-                            width,
-                            height,
-                            result["heartCenter"],
-                            result["heartPoints"],
-                            result["stringPoints"],
-                        )
-                        self.emit(("terror-visual", {
-                            "detected": result["detected"],
-                            "stringsSeen": result["stringsSeen"],
-                            "beat": result["beat"],
-                            "redCount": result["redCount"],
-                            "heartCount": result["heartCount"],
-                            "stringCount": result["stringCount"],
-                            "strength": result["strength"],
-                            "bpm": result["bpm"],
-                            "layer": result["layer"],
-                            "radiusMeters": result["radiusMeters"],
-                            "estimatedDistance": result["estimatedDistance"],
-                            "distanceLabel": result["distanceLabel"],
-                            "rgb": preview_rgb,
-                            "width": width,
-                            "height": height,
-                        }))
-                    if result["beat"] or now - self.last_score_emit_at >= 0.2:
-                        self.last_score_emit_at = now
-                        if result["detected"]:
-                            distance = result["estimatedDistance"]
-                            distance_text = f"{distance:.1f}m" if distance is not None else result["distanceLabel"]
-                            self.emit(("terror-score", f"{result['layer']} | approx {distance_text} | strings {result['stringCount']} | heart {result['heartCount']} | intensity {result['strength']:.2f} | bpm {result['bpm'] or '--'}"))
-                            if result["stringsSeen"]:
-                                self.emit(("terror-state", f"Terror strings detected: {result['layer']} ({result['distanceLabel']})."))
-                            else:
-                                self.emit(("terror-state", "Heart tracked; waiting for heartbeat strings."))
-                        else:
-                            self.emit(("terror-score", f"Outside or hidden | red {result['redCount']} | strings {result['stringCount']} | intensity {result['strength']:.2f}"))
-                            self.emit(("terror-state", "No visual heartbeat heart detected."))
-                    self.stop_event.wait(int(cfg["scanMs"]) / 1000)
-                except Exception as exc:
-                    self.emit(("terror-state", str(exc)))
-                    self.log(f"Terror radius error: {exc}")
                     self.stop_event.wait(1)
 
 
@@ -2040,12 +1912,25 @@ class Detector:
                 "-c",
                 "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .'-",
             ]
-            result = subprocess.run(command, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=10, cwd=PROJECT_DIR)
+            result = subprocess.run(
+                command,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=OCR_TESSERACT_TIMEOUT_SECONDS,
+                cwd=PROJECT_DIR,
+            )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "Tesseract OCR failed.")
             return {
                 "label": f"{label}/psm{psm}",
                 "text": result.stdout.strip(),
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "label": f"{label}/psm{psm}/timeout",
+                "text": "",
             }
         finally:
             try:
@@ -2087,7 +1972,14 @@ class Detector:
         except OSError:
             pass
 
-    def read_text_candidates_from_image(self, image, raw_path=None):
+    def read_text_candidates_from_image(self, image, raw_path=None, live_budget_seconds=None, work_queue=None):
+        started = time.perf_counter()
+
+        def should_yield_to_newer_frame():
+            if live_budget_seconds is None or work_queue is None:
+                return False
+            return time.perf_counter() - started >= live_budget_seconds and work_queue.qsize() > 0
+
         variants = self.build_ocr_variants(image)
         if self.cfg.get("saveOcrDebugImages"):
             ASSET_DIR.mkdir(parents=True, exist_ok=True)
@@ -2110,6 +2002,9 @@ class Detector:
                 candidates.append(candidate)
                 if match_map_name(candidate["text"]):
                     return candidates
+                if should_yield_to_newer_frame():
+                    candidates.append({"label": "live-budget/newer-frame", "text": ""})
+                    return candidates
 
         primary_variants = full_variants[:2]
         secondary_variants = full_variants[2:]
@@ -2117,6 +2012,9 @@ class Detector:
             candidate = self.run_tesseract(variant, label, 7)
             candidates.append(candidate)
             if match_map_name(candidate["text"]):
+                return candidates
+            if should_yield_to_newer_frame():
+                candidates.append({"label": "live-budget/newer-frame", "text": ""})
                 return candidates
             if ocr_fallback_is_promising(candidate["text"]):
                 fallback_variants.append((label, variant))
@@ -2129,6 +2027,9 @@ class Detector:
             candidates.append(candidate)
             if match_map_name(candidate["text"]):
                 return candidates
+            if should_yield_to_newer_frame():
+                candidates.append({"label": "live-budget/newer-frame", "text": ""})
+                return candidates
             recent_reasons = [ocr_noise_reason(item["text"]) for item in candidates[-2:]]
             if len(candidates) >= 2 and all(reason and reason != "no readable text" for reason in recent_reasons):
                 return candidates
@@ -2137,6 +2038,9 @@ class Detector:
             candidate = self.run_tesseract(variant, label, 7)
             candidates.append(candidate)
             if match_map_name(candidate["text"]):
+                return candidates
+            if should_yield_to_newer_frame():
+                candidates.append({"label": "live-budget/newer-frame", "text": ""})
                 return candidates
         return candidates
 
@@ -2200,6 +2104,9 @@ class Detector:
             "reason": reason,
             "created_at": time.time(),
         }
+        dropped_before_put = self.clear_ocr_queue()
+        if dropped_before_put:
+            self.ocr_queue_drop_count += dropped_before_put
         try:
             self.ocr_queue.put_nowait(job)
         except queue.Full:
@@ -2222,16 +2129,46 @@ class Detector:
 
     def clear_ocr_queue(self, work_queue=None):
         work_queue = work_queue or self.ocr_queue
+        cleared = 0
         while True:
             try:
                 work_queue.get_nowait()
                 work_queue.task_done()
+                cleared += 1
+            except queue.Empty:
+                return cleared
+
+    def get_latest_ocr_job(self, first_job, work_queue):
+        latest = first_job
+        skipped = 0
+        while True:
+            try:
+                next_job = work_queue.get_nowait()
             except queue.Empty:
                 break
+            if next_job is None:
+                if latest is not None:
+                    work_queue.task_done()
+                return None, skipped
+            if latest is not None:
+                skipped += 1
+                work_queue.task_done()
+            latest = next_job
+        if skipped:
+            self.ocr_queue_drop_count += skipped
+            self.log(f"OCR skipped {skipped} stale queued frame(s); processing newest frame {latest['id']:03d}.")
+        return latest, skipped
 
     def process_ocr_job(self, job, work_queue=None):
+        if self.ocr_until <= 0:
+            return
         started = time.perf_counter()
-        candidates = self.read_text_candidates_from_image(job["image"], job.get("raw_path"))
+        candidates = self.read_text_candidates_from_image(
+            job["image"],
+            job.get("raw_path"),
+            live_budget_seconds=2.5,
+            work_queue=work_queue,
+        )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         best_text, best_label, match, rejection_reason = summarize_ocr_candidates(candidates)
         self.save_ocr_result_debug(job.get("raw_path"), candidates, elapsed_ms, match, rejection_reason)
@@ -2256,6 +2193,9 @@ class Detector:
             except queue.Empty:
                 continue
             try:
+                if job is None:
+                    return
+                job, _skipped = self.get_latest_ocr_job(job, work_queue)
                 if job is None:
                     return
                 self.process_ocr_job(job, work_queue)
@@ -2523,6 +2463,8 @@ class MapOverlay:
         self.window.attributes("-topmost", True)
         self.label.update_idletasks()
         self.window.update_idletasks()
+        if display_image and os.name == "nt" and not drag_mode:
+            self.render_native_layered(display_image.convert("RGBA"), x, y, float(overlay_cfg.get("opacity") or 0.7))
         if drag_mode:
             self.enable_drag_mode()
         else:
@@ -2686,7 +2628,7 @@ class MapOverlay:
 
     def finish_drag(self, _event):
         if self.drag_start:
-            save_config(self.cfg)
+            save_config(self.cfg, force_overlay=True)
         self.drag_start = None
         return "break"
 
@@ -2710,7 +2652,6 @@ class MapOverlay:
             for hwnd in self.overlay_hwnds():
                 self.install_clickthrough_hit_test(user32, hwnd)
                 self.apply_clickthrough_style_to_overlay(user32, hwnd)
-                self.set_overlay_hwnd_enabled(user32, hwnd, False)
         except Exception:
             pass
 
@@ -2723,6 +2664,7 @@ class MapOverlay:
     def apply_clickthrough_style_to_overlay(self, user32, hwnd):
         try:
             gwl_exstyle = -20
+            ws_ex_layered = 0x00080000
             ws_ex_transparent = 0x00000020
             ws_ex_toolwindow = 0x00000080
             ws_ex_noactivate = 0x08000000
@@ -2731,7 +2673,7 @@ class MapOverlay:
             user32.SetWindowLongW(
                 hwnd,
                 gwl_exstyle,
-                style | ws_ex_transparent | ws_ex_toolwindow | ws_ex_noactivate,
+                style | ws_ex_layered | ws_ex_transparent | ws_ex_toolwindow | ws_ex_noactivate,
             )
             hwnd_topmost = -1
             swp_nosize = 0x0001
@@ -2775,12 +2717,14 @@ class MapOverlay:
             import ctypes
             from ctypes import wintypes
             wm_nchittest = 0x0084
+            wm_mouseactivate = 0x0021
             httransparent = -1
+            ma_noactivate = 3
             gwlp_wndproc = -4
             wndproc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
             set_window_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
             call_window_proc = user32.CallWindowProcW
-            set_window_long.restype = ctypes.c_void_p
+            set_window_long.restype = ctypes.c_ssize_t
             call_window_proc.restype = ctypes.c_ssize_t
             original = {"value": None}
 
@@ -2788,6 +2732,8 @@ class MapOverlay:
             def wndproc(window, message, wparam, lparam):
                 if message == wm_nchittest:
                     return httransparent
+                if message == wm_mouseactivate:
+                    return ma_noactivate
                 if not original["value"]:
                     return 0
                 return call_window_proc(original["value"], window, message, wparam, lparam)
@@ -2978,18 +2924,20 @@ class SkillDebugOverlay:
 
 class App:
     COLORS = {
-        "bg": "#0f141c",
-        "panel": "#151d29",
-        "panel2": "#101722",
-        "line": "#273344",
-        "text": "#edf2f7",
-        "muted": "#98a6b8",
-        "accent": "#56d0ff",
-        "accent2": "#8bd17c",
-        "warn": "#ffd166",
-        "danger": "#ff6b6b",
-        "button": "#243246",
-        "button_hover": "#2e4059",
+        "bg": "#10100f",
+        "nav": "#15120f",
+        "panel": "#1d1b18",
+        "panel2": "#131313",
+        "panel3": "#2a2621",
+        "line": "#3a342c",
+        "text": "#f7f1e8",
+        "muted": "#b0a79b",
+        "accent": "#d83a34",
+        "accent2": "#2fc18c",
+        "warn": "#e2b75a",
+        "danger": "#ef5d64",
+        "button": "#2a2621",
+        "button_hover": "#3a332b",
     }
 
     def __init__(self):
@@ -2998,14 +2946,12 @@ class App:
         self.events = queue.Queue()
         self.detector = Detector(self.cfg, self.events.put)
         self.skill_detector = SkillCheckDetector(self.cfg, self.events.put)
-        self.terror_detector = TerrorRadiusDetector(self.cfg, self.events.put)
         self.current_match = None
         self.map_library_entries = build_map_library_entries()
         self.selected_map_name = self.map_library_entries[0]["name"] if self.map_library_entries else None
         self.selected_image_paths = []
         self.selected_image_index = 0
         self.map_photo = None
-        self.terror_preview_photo = None
         self.installing_ocr = False
         self.last_overlay_log = ""
         self.suppress_overlay_updates = False
@@ -3013,11 +2959,16 @@ class App:
         self.selector_photo = None
 
         self.root = Tk()
-        self.root.title("DBD Screen OCR Detector")
-        self.root.geometry("980x720")
-        self.root.minsize(900, 640)
+        self.root.title("DBD Overlay Assistant")
+        self.root.geometry("1180x780")
+        self.root.minsize(1040, 700)
         self.root.configure(bg=self.COLORS["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.map_enabled_var = BooleanVar(value=bool(self.cfg.get("mapDetectorEnabled")))
+        self.skill_enabled_var = BooleanVar(value=bool((self.cfg.get("skillCheck") or {}).get("enabled")))
+        overlay_cfg = self.cfg.get("overlay") or {}
+        self.overlay_enabled_var = BooleanVar(value=bool(overlay_cfg.get("enabled")))
+        self.overlay_drag_var = BooleanVar(value=bool(overlay_cfg.get("dragMode")))
         self.configure_style()
         self.build_ui()
 
@@ -3026,6 +2977,7 @@ class App:
         self.render_map_view()
         self.update_overlay()
         self.render_overlay_state()
+        self.render_home_state()
         self.log("Using fast Python region capture. Full-screen screenshots are not used while watching.")
         self.log(f"Trigger polling: {self.cfg['scanMs']} ms search, {self.cfg['triggerSeenScanMs']} ms disappearance check.")
         if self.detector.tesseract:
@@ -3046,98 +2998,333 @@ class App:
         except Exception:
             pass
         style.configure("TNotebook", background=self.COLORS["bg"], borderwidth=0)
-        style.configure("TNotebook.Tab", background="#192231", foreground=self.COLORS["muted"], padding=(18, 9), borderwidth=0)
+        style.configure("TNotebook.Tab", background="#192231", foreground=self.COLORS["muted"], padding=(18, 9), borderwidth=0, font=("Segoe UI", 10, "bold"))
         style.map("TNotebook.Tab", background=[("selected", self.COLORS["panel"])], foreground=[("selected", self.COLORS["text"])])
         style.configure("Horizontal.TScale", background=self.COLORS["panel"], troughcolor=self.COLORS["panel2"])
 
     def build_ui(self):
         shell = Frame(self.root, bg=self.COLORS["bg"])
-        shell.pack(fill=BOTH, expand=True, padx=18, pady=16)
+        shell.pack(fill=BOTH, expand=True)
 
-        header = Frame(shell, bg=self.COLORS["bg"])
-        header.pack(fill="x", pady=(0, 14))
-        title_block = Frame(header, bg=self.COLORS["bg"])
-        title_block.pack(side="left", fill="x", expand=True)
+        sidebar = Frame(shell, bg=self.COLORS["nav"], width=230)
+        sidebar.pack(side=LEFT, fill=Y)
+        sidebar.pack_propagate(False)
+
+        main = Frame(shell, bg=self.COLORS["bg"])
+        main.pack(side=LEFT, fill=BOTH, expand=True)
+
+        brand = Frame(sidebar, bg=self.COLORS["nav"], padx=18, pady=20)
+        brand.pack(fill="x")
         Label(
-            title_block,
-            text="DBD Screen OCR Detector",
-            bg=self.COLORS["bg"],
-            fg=self.COLORS["text"],
-            font=("Segoe UI", 22, "bold"),
+            brand,
+            text="DBD",
+            bg=self.COLORS["nav"],
+            fg=self.COLORS["accent"],
+            font=("Segoe UI", 25, "bold"),
         ).pack(anchor="w")
         Label(
-            title_block,
-            text="Region-only trigger watch, OCR after disappearance, click-through map overlay.",
-            bg=self.COLORS["bg"],
+            brand,
+            text="Player Tools",
+            bg=self.COLORS["nav"],
+            fg=self.COLORS["text"],
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+        Label(
+            brand,
+            text="Quick toggles, clean setup, and advanced tuning when you need it.",
+            bg=self.COLORS["nav"],
             fg=self.COLORS["muted"],
-            font=("Segoe UI", 10),
-        ).pack(anchor="w", pady=(3, 0))
+            wraplength=180,
+            justify="left",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(6, 0))
 
-        status_group = Frame(header, bg=self.COLORS["bg"])
-        status_group.pack(side="right", padx=(12, 0))
-        self.terror_global_pill = self.pill(status_group, "Terror: off", "stop")
-        self.terror_global_pill.pack(side="right", padx=(8, 0))
-        self.skill_global_pill = self.pill(status_group, "Skill: off", "stop")
-        self.skill_global_pill.pack(side="right", padx=(8, 0))
-        self.run_pill = self.pill(status_group, "Map: off", "stop")
-        self.run_pill.pack(side="right")
+        self.content = Frame(main, bg=self.COLORS["bg"], padx=22, pady=20)
+        self.content.pack(fill=BOTH, expand=True)
 
-        self.tabs = ttk.Notebook(shell)
-        self.tabs.pack(fill=BOTH, expand=True)
-        self.detector_tab = Frame(self.tabs, bg=self.COLORS["bg"])
-        self.skill_tab = Frame(self.tabs, bg=self.COLORS["bg"])
-        self.terror_tab = Frame(self.tabs, bg=self.COLORS["bg"])
-        self.timing_tab = Frame(self.tabs, bg=self.COLORS["bg"])
-        self.map_tab = Frame(self.tabs, bg=self.COLORS["bg"])
-        self.overlay_tab = Frame(self.tabs, bg=self.COLORS["bg"])
-        self.tabs.add(self.detector_tab, text="Map Detector")
-        self.tabs.add(self.skill_tab, text="Skill Checks")
-        self.tabs.add(self.terror_tab, text="Terror Radius")
-        self.tabs.add(self.timing_tab, text="Timing Settings")
-        self.tabs.add(self.map_tab, text="Map Viewer")
-        self.tabs.add(self.overlay_tab, text="Overlay Settings")
+        self.home_tab = Frame(self.content, bg=self.COLORS["bg"])
+        self.detector_tab = Frame(self.content, bg=self.COLORS["bg"])
+        self.skill_tab = Frame(self.content, bg=self.COLORS["bg"])
+        self.map_tab = Frame(self.content, bg=self.COLORS["bg"])
+        self.overlay_tab = Frame(self.content, bg=self.COLORS["bg"])
+        self.timing_tab = Frame(self.content, bg=self.COLORS["bg"])
+        self.screens = [
+            self.home_tab,
+            self.detector_tab,
+            self.skill_tab,
+            self.map_tab,
+            self.overlay_tab,
+            self.timing_tab,
+        ]
 
+        nav = Frame(sidebar, bg=self.COLORS["nav"], padx=12)
+        nav.pack(fill="x", pady=(12, 0))
+        self.nav_buttons = {}
+        self.nav_button(nav, "Home", self.home_tab).pack(fill="x", pady=(0, 8))
+        self.nav_button(nav, "Setup", self.detector_tab).pack(fill="x", pady=(0, 8))
+        self.nav_button(nav, "Skill Monitor", self.skill_tab).pack(fill="x", pady=(0, 8))
+        self.nav_button(nav, "Maps", self.map_tab).pack(fill="x", pady=(0, 8))
+        self.nav_button(nav, "Overlay", self.overlay_tab).pack(fill="x", pady=(0, 8))
+        self.nav_button(nav, "Settings", self.timing_tab).pack(fill="x", pady=(0, 8))
+
+        sidebar_status = Frame(sidebar, bg=self.COLORS["nav"], padx=18, pady=12)
+        sidebar_status.pack(side="bottom", fill="x")
+        Label(sidebar_status, text="LIVE STATUS", bg=self.COLORS["nav"], fg=self.COLORS["muted"], font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 8))
+        self.run_pill = self.pill(sidebar_status, "Map: off", "stop")
+        self.run_pill.pack(fill="x", pady=(0, 8))
+        self.skill_global_pill = self.pill(sidebar_status, "Skill: off", "stop")
+        self.skill_global_pill.pack(fill="x")
+
+        self.build_home_tab()
         self.build_detector_tab()
         self.build_skill_tab()
-        self.build_terror_tab()
-        self.build_timing_tab()
         self.build_map_tab()
         self.build_overlay_tab()
+        self.build_timing_tab()
+        self.show_screen(self.home_tab)
+
+    def build_home_tab(self):
+        body = self.scroll_body(self.home_tab)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(2, weight=1)
+        body.grid_rowconfigure(2, weight=1)
+
+        hero = Frame(body, bg="#211915", highlightthickness=1, highlightbackground="#593128", padx=24, pady=20)
+        hero.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 18))
+        Label(hero, text="Home", bg="#211915", fg=self.COLORS["text"], font=("Segoe UI", 28, "bold")).pack(anchor="w")
+        Label(
+            hero,
+            text="Start what you need, confirm what is active, and keep the deeper tuning out of the way.",
+            bg="#211915",
+            fg=self.COLORS["muted"],
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(4, 0))
+
+        map_card = self.feature_card(body, "Map Detector", "Automatically reads the map when your trigger appears.")
+        map_card.grid(row=1, column=0, sticky="nsew", padx=(0, 9), pady=(0, 18))
+        self.home_map_status = self.feature_state(map_card, "Off")
+        self.home_map_detail = self.feature_detail(map_card)
+        self.check_toggle(map_card, "Map detector enabled", self.map_enabled_var, self.set_map_from_toggle).pack(fill="x", pady=(0, 10))
+        self.link_button(map_card, "Set trigger and text areas", lambda: self.show_screen(self.detector_tab)).pack(anchor="w")
+
+        skill_card = self.feature_card(body, "Skill Monitor", "Watches the skill-check ring and sends your input.")
+        skill_card.grid(row=1, column=1, sticky="nsew", padx=9, pady=(0, 18))
+        self.home_skill_status = self.feature_state(skill_card, "Off")
+        self.home_skill_detail = self.feature_detail(skill_card)
+        self.check_toggle(skill_card, "Skill assist enabled", self.skill_enabled_var, self.set_skill_from_toggle).pack(fill="x", pady=(0, 10))
+        self.link_button(skill_card, "Open live monitor", lambda: self.show_screen(self.skill_tab)).pack(anchor="w")
+
+        overlay_card = self.feature_card(body, "Map Overlay", "Shows the selected or detected map as a click-through overlay.")
+        overlay_card.grid(row=1, column=2, sticky="nsew", padx=(9, 0), pady=(0, 18))
+        self.home_overlay_status = self.feature_detail(overlay_card, lines=4)
+        self.check_toggle(overlay_card, "Map overlay enabled", self.overlay_enabled_var, self.set_overlay_from_toggle).pack(fill="x", pady=(0, 8))
+        self.check_toggle(overlay_card, "Drag mode", self.overlay_drag_var, self.set_overlay_drag_from_toggle).pack(fill="x", pady=(0, 10))
+        self.link_button(overlay_card, "Position overlay", lambda: self.show_screen(self.overlay_tab)).pack(anchor="w")
+
+        current_card = self.card(body)
+        current_card.grid(row=2, column=0, sticky="nsew", padx=(0, 9))
+        self.card_title(current_card, "Current Map")
+        self.home_current_map = Label(current_card, text="None", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 18, "bold"), anchor="w", justify="left")
+        self.home_current_map.pack(fill="x", pady=(10, 6))
+        self.home_current_map_detail = Label(current_card, text="", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Segoe UI", 10), anchor="w", justify="left")
+        self.home_current_map_detail.pack(fill="x")
+        self.link_button(current_card, "Open map library", lambda: self.show_screen(self.map_tab)).pack(anchor="w", pady=(14, 0))
+
+        activity_card = self.card(body)
+        activity_card.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=(9, 0))
+        self.card_title(activity_card, "Session Feed")
+        self.home_activity = Text(
+            activity_card,
+            height=8,
+            wrap="word",
+            bg=self.COLORS["panel2"],
+            fg=self.COLORS["muted"],
+            insertbackground=self.COLORS["text"],
+            relief="flat",
+            padx=10,
+            pady=10,
+            font=("Consolas", 9),
+        )
+        self.home_activity.pack(fill=BOTH, expand=True, pady=(8, 0))
+        self.home_activity.configure(state="disabled")
+        self.render_home_state()
+
+    def nav_button(self, parent, text, screen):
+        button = Button(
+            parent,
+            text=text,
+            command=lambda: self.show_screen(screen),
+            anchor="w",
+            bg=self.COLORS["nav"],
+            fg=self.COLORS["muted"],
+            activebackground=self.COLORS["panel3"],
+            activeforeground=self.COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=12,
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.nav_buttons[screen] = button
+        return button
+
+    def show_screen(self, screen):
+        for frame in getattr(self, "screens", []):
+            frame.pack_forget()
+        screen.pack(fill=BOTH, expand=True)
+        for frame, button in getattr(self, "nav_buttons", {}).items():
+            active = frame == screen
+            button.configure(
+                bg=self.COLORS["panel3"] if active else self.COLORS["nav"],
+                fg=self.COLORS["text"] if active else self.COLORS["muted"],
+            )
+
+    def scroll_body(self, parent):
+        canvas = Canvas(parent, bg=self.COLORS["bg"], highlightthickness=0, bd=0)
+        scrollbar = Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill=Y)
+
+        body = Frame(canvas, bg=self.COLORS["bg"])
+        window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def on_body_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def bind_mousewheel(_event=None):
+            canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        def unbind_mousewheel(_event=None):
+            canvas.unbind_all("<MouseWheel>")
+
+        body.bind("<Configure>", on_body_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+        parent.bind("<Enter>", bind_mousewheel)
+        parent.bind("<Leave>", unbind_mousewheel)
+        return body
+
+    def feature_card(self, parent, title, text):
+        frame = self.card(parent)
+        Label(frame, text=title, bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 15, "bold"), anchor="w").pack(fill="x")
+        Label(frame, text=text, bg=self.COLORS["panel"], fg=self.COLORS["muted"], wraplength=260, justify="left", font=("Segoe UI", 9)).pack(fill="x", pady=(5, 14))
+        return frame
+
+    def feature_state(self, parent, text):
+        label = Label(parent, text=text, bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 20, "bold"), anchor="w")
+        label.pack(fill="x", pady=(0, 8))
+        return label
+
+    def feature_detail(self, parent, lines=2):
+        label = Label(parent, text="", bg=self.COLORS["panel"], fg=self.COLORS["muted"], height=lines, font=("Segoe UI", 9), anchor="nw", justify="left")
+        label.pack(fill="x", pady=(0, 12))
+        return label
+
+    def check_toggle(self, parent, text, variable, command):
+        return Checkbutton(
+            parent,
+            text=text,
+            variable=variable,
+            command=command,
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["text"],
+            activebackground=self.COLORS["panel"],
+            activeforeground=self.COLORS["text"],
+            selectcolor=self.COLORS["panel2"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+            padx=0,
+            pady=3,
+        )
+
+    def link_button(self, parent, text, command):
+        return Button(
+            parent,
+            text=text,
+            command=command,
+            anchor="w",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["accent"],
+            activebackground=self.COLORS["panel"],
+            activeforeground=self.COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=0,
+            pady=4,
+            cursor="hand2",
+            font=("Segoe UI", 9, "bold"),
+        )
+
+    def set_map_from_toggle(self):
+        if self.map_enabled_var.get():
+            self.start_detection()
+        else:
+            self.stop_detection()
+
+    def set_skill_from_toggle(self):
+        if self.skill_enabled_var.get():
+            self.start_skill_checks()
+        else:
+            self.stop_skill_checks()
+
+    def set_overlay_from_toggle(self):
+        desired = bool(self.overlay_enabled_var.get())
+        if bool(self.cfg["overlay"].get("enabled")) != desired:
+            self.cfg["overlay"]["enabled"] = desired
+            save_config(self.cfg, force_overlay=True)
+            self.update_overlay()
+            self.render_overlay_state()
+            self.render_home_state()
+
+    def set_overlay_drag_from_toggle(self):
+        desired = bool(self.overlay_drag_var.get())
+        if bool(self.cfg["overlay"].get("dragMode")) != desired:
+            self.cfg["overlay"]["dragMode"] = desired
+            save_config(self.cfg, force_overlay=True)
+            self.update_overlay()
+            self.render_overlay_state()
+            self.render_home_state()
 
     def build_detector_tab(self):
-        grid = Frame(self.detector_tab, bg=self.COLORS["bg"])
-        grid.pack(fill=BOTH, expand=True, pady=14)
-        grid.grid_columnconfigure(0, weight=2)
+        grid = self.scroll_body(self.detector_tab)
+        grid.grid_columnconfigure(0, weight=1)
         grid.grid_columnconfigure(1, weight=1)
         grid.grid_rowconfigure(1, weight=1)
 
+        setup_card = self.card(grid)
+        setup_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 12))
+        self.card_title(setup_card, "Capture Setup")
+        self.boxes = Label(setup_card, text=self.box_summary(), anchor="w", justify="left", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 9))
+        self.boxes.pack(fill="x", pady=(10, 14))
+        actions = Frame(setup_card, bg=self.COLORS["panel"])
+        actions.pack(fill="x")
+        self.button(actions, "Trigger Area", lambda: self.select_area("trigger"), "primary").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.button(actions, "Text Area", lambda: self.select_area("text")).pack(side="left", fill="x", expand=True, padx=6)
+        self.button(actions, "Recapture", lambda: self.select_area("trigger")).pack(side="left", fill="x", expand=True, padx=(6, 0))
+
         status_card = self.card(grid)
-        status_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 12))
-        self.card_title(status_card, "Watch Status")
-        self.status = Label(status_card, text="Ready.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 14, "bold"))
-        self.status.pack(fill="x", pady=(6, 6))
+        status_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0), pady=(0, 12))
+        self.card_title(status_card, "Detector Status")
+        self.check_toggle(status_card, "Map detector enabled", self.map_enabled_var, self.set_map_from_toggle).pack(fill="x", pady=(10, 12))
+        self.status = Label(status_card, text="Ready.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 16, "bold"))
+        self.status.pack(fill="x", pady=(0, 8))
         self.score = Label(status_card, text="No trigger score yet.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 10))
         self.score.pack(fill="x")
 
-        controls = Frame(status_card, bg=self.COLORS["panel"])
-        controls.pack(fill="x", pady=(16, 0))
-        self.button(controls, "Enable Map Detector", self.start_detection, "primary").pack(side="left", padx=(0, 8))
-        self.button(controls, "Disable", self.stop_detection, "danger").pack(side="left", padx=(0, 8))
-
-        setup_card = self.card(grid)
-        setup_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0), pady=(0, 12))
-        self.card_title(setup_card, "Setup")
-        self.boxes = Label(setup_card, text=self.box_summary(), anchor="w", justify="left", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 9))
-        self.boxes.pack(fill="x", pady=(6, 14))
-        self.button(setup_card, "Set Trigger Area", lambda: self.select_area("trigger"), "primary").pack(fill="x", pady=(0, 8))
-        self.button(setup_card, "Recapture Trigger", lambda: self.select_area("trigger")).pack(fill="x", pady=(0, 8))
-        self.button(setup_card, "Set Text Area", lambda: self.select_area("text")).pack(fill="x", pady=(0, 8))
-        self.button(setup_card, "Toggle OCR Debug Images", self.toggle_ocr_debug_images).pack(fill="x", pady=(0, 8))
-        self.button(setup_card, "Clear Debug Images", self.clear_debug_images).pack(fill="x")
-
         ocr_card = self.card(grid)
         ocr_card.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
-        self.card_title(ocr_card, "OCR Output")
+        self.card_title(ocr_card, "Detected Text")
         self.ocr = Text(
             ocr_card,
             height=8,
@@ -3155,7 +3342,7 @@ class App:
 
         log_card = self.card(grid)
         log_card.grid(row=1, column=1, sticky="nsew", padx=(10, 0))
-        self.card_title(log_card, "Log")
+        self.card_title(log_card, "Session Feed")
         self.log_box = Text(
             log_card,
             height=12,
@@ -3172,215 +3359,143 @@ class App:
         self.log_box.configure(state="disabled")
 
     def build_skill_tab(self):
-        body = Frame(self.skill_tab, bg=self.COLORS["bg"])
-        body.pack(fill=BOTH, expand=True, pady=14)
-        body.grid_columnconfigure(0, weight=1)
+        body = self.scroll_body(self.skill_tab)
+        body.grid_columnconfigure(0, weight=2)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
 
         state = self.card(body)
         state.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        self.card_title(state, "Skill Check Watcher")
-        self.skill_pill = self.pill(state, "Stopped", "stop")
-        self.skill_pill.pack(anchor="w", pady=(8, 10))
-        self.skill_status = Label(state, text="Ready.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 14, "bold"))
-        self.skill_status.pack(fill="x", pady=(6, 6))
-        self.skill_score = Label(state, text="No scan yet.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 10))
-        self.skill_score.pack(fill="x")
-        now_row = Frame(state, bg=self.COLORS["panel"])
-        now_row.pack(fill="x", pady=(12, 0))
-        self.skill_white_pill = self.pill(now_row, "White: no", "stop")
-        self.skill_white_pill.pack(side="left", padx=(0, 8))
-        self.skill_zone_pill = self.pill(now_row, "Zones: 0/0", "stop")
-        self.skill_zone_pill.pack(side="left", padx=(0, 8))
-        self.skill_red_pill = self.pill(now_row, "Red in zone: no", "stop")
-        self.skill_red_pill.pack(side="left", padx=(0, 8))
-        self.skill_hit_pill = self.pill(now_row, "Hit: no", "stop")
-        self.skill_hit_pill.pack(side="left")
+        self.card_title(state, "Live Skill Monitor")
+        self.check_toggle(state, "Skill assist enabled", self.skill_enabled_var, self.set_skill_from_toggle).pack(fill="x", pady=(10, 10))
         self.skill_preview_photo = None
         self.skill_preview = Label(state, text="Live preview will appear while watching.", bg=self.COLORS["panel2"], fg=self.COLORS["muted"], font=("Segoe UI", 10), compound="center")
-        self.skill_preview.pack(fill=BOTH, expand=True, pady=(14, 0))
+        self.skill_preview.pack(fill=BOTH, expand=True, pady=(0, 8))
         self.skill_preview_legend = Label(
             state,
-            text="Preview: white=current zone, cyan=armed middle band, orange=red needle, red=red inside middle band. Screen overlay uses sparse cyan boundaries and magenta hit dots.",
+            text="Preview: cyan outline = detected marker, yellow outline = press target, orange = red marker, magenta = red inside target.",
             bg=self.COLORS["panel"],
             fg=self.COLORS["muted"],
             font=("Segoe UI", 9),
             anchor="w",
         )
         self.skill_preview_legend.pack(fill="x", pady=(6, 0))
-        self.skill_box_label = Label(state, text=self.skill_box_summary(), anchor="w", justify="left", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 9))
-        self.skill_box_label.pack(fill="x", pady=(12, 14))
-        controls = Frame(state, bg=self.COLORS["panel"])
-        controls.pack(fill="x")
-        self.button(controls, "Enable Skill Checks", self.start_skill_checks, "primary").pack(side="left", padx=(0, 8))
-        self.button(controls, "Disable", self.stop_skill_checks, "danger").pack(side="left")
-        self.button(state, "Set Skill Check Area", lambda: self.select_area("skill", frozen=True), "primary").pack(fill="x", pady=(16, 8))
-        self.button(state, "Toggle Screen Debug Overlay", self.toggle_skill_debug_overlay).pack(fill="x", pady=(0, 8))
-        self.button(state, "Toggle Debug Image Saving", self.toggle_skill_debug_images).pack(fill="x", pady=(0, 8))
-        self.button(state, "Open Debug Folder", self.open_skill_debug_folder).pack(fill="x")
 
-        settings = self.card(body)
-        settings.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        self.card_title(settings, "Skill Check Settings")
-        Label(
-            settings,
-            text="Use a tight box around the skill-check circle. Smaller boxes are faster and more accurate.",
-            bg=self.COLORS["panel"],
-            fg=self.COLORS["muted"],
-            wraplength=380,
-            justify="left",
-            font=("Segoe UI", 10),
-        ).pack(fill="x", pady=(8, 8))
+        side = Frame(body, bg=self.COLORS["bg"])
+        side.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        side.grid_rowconfigure(1, weight=1)
 
-        self.skill_entries = {}
-        self.skill_input_row(settings, "Press input", "pressKey", "", "", "")
-        self.skill_input_row(settings, "White minimum", "whiteMin", 120, 255, "rgb")
-        self.skill_input_row(settings, "White spread", "whiteSpreadMax", 10, 160, "rgb")
-        self.skill_input_row(settings, "White zone size", "minWhitePixels", 1, 200, "px")
-        self.skill_input_row(settings, "Single zone size", "minWhiteZonePixels", 1, 300, "px")
-        self.skill_input_row(settings, "Zone thickness max", "maxWhiteZoneRadialSpan", 1, 80, "px")
-        self.skill_input_row(settings, "Zone gap merge", "whiteAngleGapDeg", 0, 30, "deg")
-        self.skill_input_row(settings, "White angle span", "minWhiteAngleSpan", 1, 90, "deg")
-        self.skill_input_row(settings, "Ring evidence", "minRingOutlineBins", 0, 360, "deg")
-        self.skill_input_row(settings, "Ring max fill", "maxRingOutlinePercent", 1, 100, "%")
-        self.skill_input_row(settings, "Center prompt", "minCenterPromptPixels", 0, 2000, "px")
-        self.skill_input_row(settings, "Center max", "maxCenterPromptPixels", 0, 5000, "px")
-        self.skill_input_row(settings, "Red minimum", "redMin", 80, 255, "rgb")
-        self.skill_input_row(settings, "Red other max", "redOtherMax", 0, 220, "rgb")
-        self.skill_input_row(settings, "Hit tolerance", "hitTolerancePx", 0, 20, "px")
-        self.skill_input_row(settings, "Angle tolerance", "angleToleranceDeg", 1, 45, "deg")
-        self.skill_input_row(settings, "Hit depth", "hitDepthPercent", 0, 95, "%")
-        self.skill_input_row(settings, "Hit window end", "hitWindowEndPercent", 0, 100, "%")
-        self.skill_input_row(settings, "Red hit pixels", "minRedPixels", 1, 200, "px")
-        self.skill_input_row(settings, "Ring inner", "ringInnerPercent", 0, 100, "%")
-        self.skill_input_row(settings, "Ring outer", "ringOuterPercent", 1, 120, "%")
-        self.button(settings, "Apply Skill Check Settings", self.apply_skill_settings, "primary").pack(fill="x", pady=(14, 0))
-
-    def build_terror_tab(self):
-        body = Frame(self.terror_tab, bg=self.COLORS["bg"])
-        body.pack(fill=BOTH, expand=True, pady=14)
-        body.grid_columnconfigure(0, weight=1)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
-
-        state = self.card(body)
-        state.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        self.card_title(state, "Terror Radius Distance")
-        self.terror_pill = self.pill(state, "Stopped", "stop")
-        self.terror_pill.pack(anchor="w", pady=(8, 10))
-        self.terror_status = Label(state, text="Ready.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 14, "bold"))
-        self.terror_status.pack(fill="x", pady=(6, 6))
-        self.terror_score = Label(state, text="No scan yet.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 10))
-        self.terror_score.pack(fill="x")
-
-        now_row = Frame(state, bg=self.COLORS["panel"])
+        status = self.card(side)
+        status.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        self.card_title(status, "Now")
+        self.skill_pill = self.pill(status, "Stopped", "stop")
+        self.skill_pill.pack(fill="x", pady=(10, 8))
+        self.skill_status = Label(status, text="Ready.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 14, "bold"), justify="left", wraplength=280)
+        self.skill_status.pack(fill="x", pady=(0, 8))
+        self.skill_score = Label(status, text="No scan yet.", anchor="w", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 10), justify="left", wraplength=280)
+        self.skill_score.pack(fill="x")
+        now_row = Frame(status, bg=self.COLORS["panel"])
         now_row.pack(fill="x", pady=(12, 0))
-        self.terror_detect_pill = self.pill(now_row, "Heart: no", "stop")
-        self.terror_detect_pill.pack(side="left", padx=(0, 8))
-        self.terror_layer_pill = self.pill(now_row, "Layer: --", "stop")
-        self.terror_layer_pill.pack(side="left", padx=(0, 8))
-        self.terror_beat_pill = self.pill(now_row, "Beat: --", "stop")
-        self.terror_beat_pill.pack(side="left")
+        self.skill_white_pill = self.pill(now_row, "White: no", "stop")
+        self.skill_white_pill.pack(fill="x", pady=(0, 6))
+        self.skill_zone_pill = self.pill(now_row, "Markers: 0", "stop")
+        self.skill_zone_pill.pack(fill="x", pady=(0, 6))
+        self.skill_red_pill = self.pill(now_row, "Red in zone: no", "stop")
+        self.skill_red_pill.pack(fill="x", pady=(0, 6))
+        self.skill_hit_pill = self.pill(now_row, "Hit: no", "stop")
+        self.skill_hit_pill.pack(fill="x")
 
-        self.terror_preview = Label(state, text="Live preview will appear while watching.", bg=self.COLORS["panel2"], fg=self.COLORS["muted"], font=("Segoe UI", 10), compound="center")
-        self.terror_preview.pack(fill=BOTH, expand=True, pady=(14, 0))
-        Label(
-            state,
-            text="Preview: yellow = tracked heart, red = heartbeat strings counted for distance",
-            bg=self.COLORS["panel"],
-            fg=self.COLORS["muted"],
-            font=("Segoe UI", 9),
-            anchor="w",
-        ).pack(fill="x", pady=(6, 0))
-        self.terror_box_label = Label(state, text=self.terror_box_summary(), anchor="w", justify="left", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 9))
-        self.terror_box_label.pack(fill="x", pady=(12, 14))
-
-        controls = Frame(state, bg=self.COLORS["panel"])
-        controls.pack(fill="x")
-        self.button(controls, "Enable Terror Radius", self.start_terror_radius, "primary").pack(side="left", padx=(0, 8))
-        self.button(controls, "Disable", self.stop_terror_radius, "danger").pack(side="left")
-        self.button(state, "Set Terror Radius Area", lambda: self.select_area("terror"), "primary").pack(fill="x", pady=(16, 0))
-
-        settings = self.card(body)
-        settings.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        self.card_title(settings, "Terror Radius Settings")
-        Label(
-            settings,
-            text="Use a tight box around the visual heartbeat. Set radius to the killer's expected terror radius for better meter estimates.",
-            bg=self.COLORS["panel"],
-            fg=self.COLORS["muted"],
-            wraplength=380,
-            justify="left",
-            font=("Segoe UI", 10),
-        ).pack(fill="x", pady=(8, 8))
-
-        self.terror_entries = {}
-        self.terror_box_entries = {}
-        self.card_title(settings, "Area Coordinates")
-        self.terror_box_input_row(settings, "X", "x", 0, 10000, "px")
-        self.terror_box_input_row(settings, "Y", "y", 0, 10000, "px")
-        self.terror_box_input_row(settings, "Width", "width", 6, 4000, "px")
-        self.terror_box_input_row(settings, "Height", "height", 6, 4000, "px")
-        self.button(settings, "Apply Area Coordinates", self.apply_terror_area_coordinates).pack(fill="x", pady=(8, 12))
-        self.card_title(settings, "Detection")
-        self.terror_input_row(settings, "Scan interval", "scanMs", 25, 1000, "ms")
-        self.terror_input_row(settings, "Radius size", "radiusMeters", 8, 80, "m")
-        self.terror_input_row(settings, "Red minimum", "redMin", 40, 255, "rgb")
-        self.terror_input_row(settings, "Red dominance", "redDominance", 0, 160, "rgb")
-        self.terror_input_row(settings, "Minimum red pixels", "minRedPixels", 1, 1000, "px")
-        self.terror_input_row(settings, "Full red area", "fullRedPercent", 1, 80, "%")
-        self.terror_input_row(settings, "Pulse threshold", "pulseThreshold", 1, 80, "%")
-        self.button(settings, "Apply Terror Radius Settings", self.apply_terror_settings, "primary").pack(fill="x", pady=(14, 0))
+        setup = self.card(side)
+        setup.grid(row=1, column=0, sticky="nsew")
+        self.card_title(setup, "Skill Area")
+        self.skill_box_label = Label(setup, text=self.skill_box_summary(), anchor="w", justify="left", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Consolas", 9))
+        self.skill_box_label.pack(fill="x", pady=(10, 14))
+        self.button(setup, "Select Skill Area", lambda: self.select_area("skill", frozen=True), "primary").pack(fill="x", pady=(0, 10))
+        self.link_button(setup, "Tune skill detection in Settings", lambda: self.show_screen(self.timing_tab)).pack(anchor="w")
 
     def build_timing_tab(self):
-        body = Frame(self.timing_tab, bg=self.COLORS["bg"])
-        body.pack(fill=BOTH, expand=True, pady=14)
+        body = self.scroll_body(self.timing_tab)
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(2, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_rowconfigure(1, weight=1)
 
-        settings = self.card(body)
-        settings.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        self.card_title(settings, "Timing Settings")
+        timing = self.card(body)
+        timing.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 12))
+        self.card_title(timing, "Map Detection Timing")
         Label(
-            settings,
-            text="Type millisecond values, then click Apply. Start Watching also applies pending edits first.",
+            timing,
+            text="Only affects map detection and OCR. Skill checks use their own fast loop.",
             bg=self.COLORS["panel"],
             fg=self.COLORS["muted"],
             wraplength=380,
             justify="left",
             font=("Segoe UI", 10),
         ).pack(fill="x", pady=(8, 8))
-
         self.timing_entries = {}
-        self.timing_input_row(settings, "Search delay", "scanMs", 100, 5000, "ms")
-        self.timing_input_row(settings, "Disappear check", "triggerSeenScanMs", 50, 2000, "ms")
-        self.timing_input_row(settings, "OCR interval", "ocrIntervalMs", 50, 10000, "ms")
-        self.timing_input_row(settings, "OCR window", "ocrWindowMs", 1000, 120000, "ms")
-        self.button(settings, "Apply Timing Settings", self.apply_timing_settings, "primary").pack(fill="x", pady=(14, 0))
+        self.timing_input_row(timing, "Search delay", "scanMs", 100, 5000, "ms")
+        self.timing_input_row(timing, "Disappear check", "triggerSeenScanMs", 50, 2000, "ms")
+        self.timing_input_row(timing, "OCR interval", "ocrIntervalMs", 50, 10000, "ms")
+        self.timing_input_row(timing, "OCR window", "ocrWindowMs", 1000, 120000, "ms")
+        self.button(timing, "Apply Timing", self.apply_timing_settings, "primary").pack(fill="x", pady=(14, 0))
 
-        notes = self.card(body)
-        notes.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        self.card_title(notes, "What They Do")
-        timing_help = (
-            "Search delay: how often the app checks for the trigger before it is visible.\n\n"
-            "Disappear check: how often it checks for the trigger to disappear after it was found.\n\n"
-            "OCR interval: how often OCR repeats during the OCR window.\n\n"
-            "OCR window: how long OCR keeps trying after the trigger disappears."
-        )
+        settings = self.card(body)
+        settings.grid(row=0, column=1, rowspan=2, columnspan=2, sticky="nsew", padx=(10, 0))
+        self.card_title(settings, "Skill Detection Tuning")
+        self.skill_entries = {}
+        skill_grid = Frame(settings, bg=self.COLORS["panel"])
+        skill_grid.pack(fill=BOTH, expand=True, pady=(8, 0))
+        skill_grid.grid_columnconfigure(0, weight=1)
+        skill_grid.grid_columnconfigure(1, weight=1)
+        skill_left = Frame(skill_grid, bg=self.COLORS["panel"])
+        skill_left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        skill_right = Frame(skill_grid, bg=self.COLORS["panel"])
+        skill_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self.skill_input_row(skill_left, "Press input", "pressKey", "", "", "")
+        self.skill_input_row(skill_left, "White minimum", "whiteMin", 120, 255, "rgb")
+        self.skill_input_row(skill_left, "White spread", "whiteSpreadMax", 10, 160, "rgb")
+        self.skill_input_row(skill_left, "White zone size", "minWhitePixels", 1, 200, "px")
+        self.skill_input_row(skill_left, "Single zone size", "minWhiteZonePixels", 1, 300, "px")
+        self.skill_input_row(skill_left, "Zone thickness max", "maxWhiteZoneRadialSpan", 1, 80, "px")
+        self.skill_input_row(skill_left, "Zone gap merge", "whiteAngleGapDeg", 0, 30, "deg")
+        self.skill_input_row(skill_left, "White angle span", "minWhiteAngleSpan", 1, 90, "deg")
+        self.skill_input_row(skill_left, "Ring evidence", "minRingOutlineBins", 0, 360, "deg")
+        self.skill_input_row(skill_left, "Ring max fill", "maxRingOutlinePercent", 1, 100, "%")
+        self.skill_input_row(skill_left, "Center prompt", "minCenterPromptPixels", 0, 2000, "px")
+        self.skill_input_row(skill_right, "Center max", "maxCenterPromptPixels", 0, 5000, "px")
+        self.skill_input_row(skill_right, "Red minimum", "redMin", 80, 255, "rgb")
+        self.skill_input_row(skill_right, "Red other max", "redOtherMax", 0, 220, "rgb")
+        self.skill_input_row(skill_right, "Great tolerance", "greatHitTolerancePx", 0, 6, "px")
+        self.skill_input_row(skill_right, "Great lead", "greatLeadDegrees", 0, 30, "deg")
+        self.skill_input_row(skill_right, "Great red pixels", "minGreatRedPixels", 1, 50, "px")
+        self.skill_input_row(skill_right, "Hit tolerance", "hitTolerancePx", 0, 20, "px")
+        self.skill_input_row(skill_right, "Angle tolerance", "angleToleranceDeg", 1, 45, "deg")
+        self.skill_input_row(skill_right, "Red hit pixels", "minRedPixels", 1, 200, "px")
+        self.skill_input_row(skill_right, "Ring inner", "ringInnerPercent", 0, 100, "%")
+        self.skill_input_row(skill_right, "Ring outer", "ringOuterPercent", 1, 120, "%")
+        self.button(settings, "Apply Skill Tuning", self.apply_skill_settings, "primary").pack(fill="x", pady=(14, 0))
+
+        debug = self.card(body)
+        debug.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        self.card_title(debug, "Maintenance")
         Label(
-            notes,
-            text=timing_help,
+            debug,
+            text="Debug tools are here so normal screens stay clean.",
             bg=self.COLORS["panel"],
             fg=self.COLORS["muted"],
-            justify="left",
             wraplength=420,
-            font=("Segoe UI", 11),
-        ).pack(fill=BOTH, expand=True, pady=(10, 0))
+            justify="left",
+            font=("Segoe UI", 10),
+        ).pack(fill="x", pady=(8, 10))
+        self.button(debug, "Toggle Skill Screen Overlay", self.toggle_skill_debug_overlay).pack(fill="x", pady=(0, 8))
+        self.button(debug, "Toggle Skill Debug Images", self.toggle_skill_debug_images).pack(fill="x", pady=(0, 8))
+        self.button(debug, "Toggle OCR Debug Images", self.toggle_ocr_debug_images).pack(fill="x", pady=(0, 8))
+        self.button(debug, "Open Skill Debug Folder", self.open_skill_debug_folder).pack(fill="x", pady=(0, 8))
+        self.button(debug, "Clear Generated Debug Files", self.clear_debug_images, "danger").pack(fill="x")
 
     def build_map_tab(self):
-        body = Frame(self.map_tab, bg=self.COLORS["bg"])
-        body.pack(fill=BOTH, expand=True, pady=14)
+        body = self.scroll_body(self.map_tab)
         body.grid_columnconfigure(0, weight=0)
         body.grid_columnconfigure(1, weight=1)
         body.grid_columnconfigure(2, weight=1)
@@ -3467,67 +3582,73 @@ class App:
             self.selected_map_name = self.map_library_entries[0]["name"]
             self.render_map_view()
         self.log("Map image library refreshed.")
+        self.render_home_state()
 
     def build_overlay_tab(self):
-        body = Frame(self.overlay_tab, bg=self.COLORS["bg"])
-        body.pack(fill=BOTH, expand=True, pady=14)
+        body = self.scroll_body(self.overlay_tab)
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(2, weight=1)
 
         state = self.card(body)
         state.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        self.card_title(state, "Screen Map Overlay")
+        self.card_title(state, "Overlay Mode")
         self.overlay_pill = self.pill(state, "Off", "stop")
-        self.overlay_pill.pack(anchor="w", pady=(8, 10))
-        self.overlay_detail = Label(state, text="", bg=self.COLORS["panel"], fg=self.COLORS["muted"], justify="left", wraplength=380, font=("Segoe UI", 10))
-        self.overlay_detail.pack(fill="x", pady=(0, 16))
-        self.button(state, "Enable / Disable Overlay", self.toggle_overlay, "primary").pack(fill="x", pady=(0, 8))
-        self.button(state, "Enable / Disable Drag Mode", self.toggle_overlay_drag_mode).pack(fill="x")
+        self.overlay_pill.pack(fill="x", pady=(10, 10))
+        self.overlay_detail = Label(state, text="", bg=self.COLORS["panel"], fg=self.COLORS["muted"], justify="left", wraplength=400, font=("Segoe UI", 11))
+        self.overlay_detail.pack(fill="x", pady=(0, 18))
+        self.check_toggle(state, "Show map overlay", self.overlay_enabled_var, self.set_overlay_from_toggle).pack(fill="x", pady=(0, 10))
+        self.check_toggle(state, "Drag mode", self.overlay_drag_var, self.set_overlay_drag_from_toggle).pack(fill="x", pady=(0, 14))
 
         settings = self.card(body)
         settings.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        self.card_title(settings, "Position and Appearance")
+        self.card_title(settings, "Screen Corner")
         self.position_label = self.setting_row(settings, "Corner")
         top_buttons = Frame(settings, bg=self.COLORS["panel"])
-        top_buttons.pack(fill="x", pady=(0, 8))
+        top_buttons.pack(fill="x", pady=(6, 8))
         self.button(top_buttons, "Top Left", lambda: self.set_overlay_position("top-left")).pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.button(top_buttons, "Top Right", lambda: self.set_overlay_position("top-right")).pack(side="left", fill="x", expand=True, padx=(5, 0))
         bottom_buttons = Frame(settings, bg=self.COLORS["panel"])
         bottom_buttons.pack(fill="x", pady=(0, 12))
         self.button(bottom_buttons, "Bottom Left", lambda: self.set_overlay_position("bottom-left")).pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.button(bottom_buttons, "Bottom Right", lambda: self.set_overlay_position("bottom-right")).pack(side="left", fill="x", expand=True, padx=(5, 0))
-        self.size_label = self.scale_row(settings, "Size", "sizePercent", 10, 85, "%")
-        self.opacity_label = self.scale_row(settings, "Transparency", "opacity", 10, 100, "%", scale_value=lambda v: float(v) / 100, display_value=lambda v: int(float(v) * 100))
-        self.margin_label = self.scale_row(settings, "Screen margin", "margin", 0, 200, "px")
+
+        appearance = self.card(body)
+        appearance.grid(row=0, column=2, sticky="nsew", padx=(10, 0))
+        self.card_title(appearance, "Size and Visibility")
+        self.size_label = self.scale_row(appearance, "Size", "sizePercent", 10, 85, "%")
+        self.opacity_label = self.scale_row(appearance, "Transparency", "opacity", 10, 100, "%", scale_value=lambda v: float(v) / 100, display_value=lambda v: int(float(v) * 100))
+        self.margin_label = self.scale_row(appearance, "Screen margin", "margin", 0, 200, "px")
 
     def card(self, parent):
-        frame = Frame(parent, bg=self.COLORS["panel"], highlightthickness=1, highlightbackground=self.COLORS["line"], padx=16, pady=14)
+        frame = Frame(parent, bg=self.COLORS["panel"], highlightthickness=1, highlightbackground=self.COLORS["line"], padx=18, pady=16)
         return frame
 
     def card_title(self, parent, text):
-        Label(parent, text=text, bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 12, "bold"), anchor="w").pack(fill="x")
+        Label(parent, text=text.upper(), bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x")
 
     def button(self, parent, text, command, variant="secondary"):
-        bg = self.COLORS["accent"] if variant == "primary" else self.COLORS["danger"] if variant == "danger" else self.COLORS["button"]
-        fg = "#07111c" if variant == "primary" else "#ffffff"
+        bg = self.COLORS["accent"] if variant == "primary" else self.COLORS["danger"] if variant == "danger" else self.COLORS["panel3"]
+        hover = "#f04b45" if variant == "primary" else "#ff777a" if variant == "danger" else self.COLORS["button_hover"]
+        fg = "#ffffff"
         return Button(
             parent,
             text=text,
             command=command,
             bg=bg,
             fg=fg,
-            activebackground=self.COLORS["button_hover"],
+            activebackground=hover,
             activeforeground="#ffffff",
             relief="flat",
             bd=0,
-            padx=14,
-            pady=8,
+            padx=16,
+            pady=10,
             cursor="hand2",
             font=("Segoe UI", 10, "bold"),
         )
 
     def pill(self, parent, text, kind):
-        label = Label(parent, text=text, padx=12, pady=5, font=("Segoe UI", 9, "bold"))
+        label = Label(parent, text=text, padx=12, pady=7, font=("Segoe UI", 9, "bold"), anchor="w")
         self.set_pill(label, text, kind)
         return label
 
@@ -3563,10 +3684,11 @@ class App:
         def on_change(value):
             next_value = scale_value(value) if scale_value else float(value)
             self.cfg["overlay"][key] = next_value
-            save_config(self.cfg)
+            save_config(self.cfg, force_overlay=True)
             value_label.configure(text=f"{int(round(float(value)))}{suffix}")
             self.update_overlay()
             self.render_overlay_state()
+            self.render_home_state()
 
         scale.configure(command=on_change)
         return value_label
@@ -3632,64 +3754,6 @@ class App:
         entry.bind("<Return>", lambda _event: self.apply_skill_settings())
         return entry
 
-    def terror_input_row(self, parent, label, key, minimum, maximum, suffix):
-        row = Frame(parent, bg=self.COLORS["panel"])
-        row.pack(fill="x", pady=(10, 3))
-        Label(row, text=label, bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Segoe UI", 10, "bold")).pack(anchor="w")
-
-        input_row = Frame(parent, bg=self.COLORS["panel"])
-        input_row.pack(fill="x", pady=(0, 4))
-        entry = Entry(
-            input_row,
-            bg=self.COLORS["panel2"],
-            fg=self.COLORS["text"],
-            insertbackground=self.COLORS["text"],
-            relief="flat",
-            font=("Consolas", 10),
-        )
-        entry.insert(0, str(self.cfg["terrorRadius"].get(key, DEFAULT_CONFIG["terrorRadius"].get(key, ""))))
-        entry.pack(side="left", fill="x", expand=True, ipady=5)
-        Label(input_row, text=suffix, bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Segoe UI", 10)).pack(side="left", padx=(8, 0))
-        Label(parent, text=f"{minimum}-{maximum} {suffix}", bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 2))
-        self.terror_entries[key] = {
-            "entry": entry,
-            "label": label,
-            "minimum": int(minimum),
-            "maximum": int(maximum),
-            "suffix": suffix,
-        }
-        entry.bind("<Return>", lambda _event: self.apply_terror_settings())
-        return entry
-
-    def terror_box_input_row(self, parent, label, key, minimum, maximum, suffix):
-        row = Frame(parent, bg=self.COLORS["panel"])
-        row.pack(fill="x", pady=(8, 2))
-        Label(row, text=label, bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Segoe UI", 10, "bold")).pack(anchor="w")
-
-        input_row = Frame(parent, bg=self.COLORS["panel"])
-        input_row.pack(fill="x", pady=(0, 2))
-        entry = Entry(
-            input_row,
-            bg=self.COLORS["panel2"],
-            fg=self.COLORS["text"],
-            insertbackground=self.COLORS["text"],
-            relief="flat",
-            font=("Consolas", 10),
-        )
-        box = self.cfg["terrorRadius"].get("box") or DEFAULT_CONFIG["terrorRadius"]["box"]
-        entry.insert(0, str(int(box.get(key, minimum))))
-        entry.pack(side="left", fill="x", expand=True, ipady=5)
-        Label(input_row, text=suffix, bg=self.COLORS["panel"], fg=self.COLORS["muted"], font=("Segoe UI", 10)).pack(side="left", padx=(8, 0))
-        self.terror_box_entries[key] = {
-            "entry": entry,
-            "label": label,
-            "minimum": int(minimum),
-            "maximum": int(maximum),
-            "suffix": suffix,
-        }
-        entry.bind("<Return>", lambda _event: self.apply_terror_area_coordinates())
-        return entry
-
     def apply_skill_settings(self):
         changed = []
         skill = self.cfg["skillCheck"]
@@ -3717,15 +3781,6 @@ class App:
                 maximum = int(skill.get("maxWhiteAngleSpan", DEFAULT_CONFIG["skillCheck"]["maxWhiteAngleSpan"]))
                 if maximum < value:
                     skill["maxWhiteAngleSpan"] = value
-            elif key == "hitDepthPercent":
-                window_end = int(skill.get("hitWindowEndPercent", DEFAULT_CONFIG["skillCheck"]["hitWindowEndPercent"]))
-                if window_end < value:
-                    skill["hitWindowEndPercent"] = value
-            elif key == "hitWindowEndPercent":
-                depth = int(skill.get("hitDepthPercent", DEFAULT_CONFIG["skillCheck"]["hitDepthPercent"]))
-                if value < depth:
-                    value = depth
-                    skill[key] = value
             entry.delete(0, END)
             entry.insert(0, str(value))
             if value != old_value:
@@ -3736,64 +3791,6 @@ class App:
             self.log("Skill check settings applied: " + ", ".join(changed))
         else:
             self.log("Skill check settings applied.")
-        return True
-
-    def apply_terror_settings(self):
-        changed = []
-        terror = self.cfg["terrorRadius"]
-        for key, meta in self.terror_entries.items():
-            entry = meta["entry"]
-            raw = entry.get().strip()
-            old_value = terror.get(key)
-            try:
-                value = int(float(raw))
-            except ValueError:
-                value = int(terror.get(key, DEFAULT_CONFIG["terrorRadius"].get(key, meta["minimum"])))
-            value = max(meta["minimum"], min(meta["maximum"], value))
-            terror[key] = value
-            entry.delete(0, END)
-            entry.insert(0, str(value))
-            if value != old_value:
-                changed.append(f"{meta['label']} = {value}{meta['suffix']}")
-
-        save_config(self.cfg)
-        self.terror_box_label.configure(text=self.terror_box_summary())
-        if changed:
-            self.log("Terror radius settings applied: " + ", ".join(changed))
-        else:
-            self.log("Terror radius settings applied.")
-        return True
-
-    def apply_terror_area_coordinates(self):
-        current = self.cfg["terrorRadius"].get("box") or DEFAULT_CONFIG["terrorRadius"]["box"]
-        values = {}
-        for key, meta in self.terror_box_entries.items():
-            entry = meta["entry"]
-            raw = entry.get().strip()
-            try:
-                value = int(float(raw))
-            except ValueError:
-                value = int(current.get(key, meta["minimum"]))
-            value = max(meta["minimum"], min(meta["maximum"], value))
-            values[key] = value
-
-        box = clean_box(values)
-        if not box:
-            self.terror_status.configure(text="Terror radius area is too small.")
-            self.log("Terror radius area coordinates rejected: area is too small.")
-            return False
-        dbd = find_dbd_window_bounds()
-        if dbd:
-            box["relativeTo"] = "dbd-window"
-            box["baseWidth"] = dbd["width"]
-            box["baseHeight"] = dbd["height"]
-
-        self.cfg["terrorRadius"]["box"] = box
-        save_config(self.cfg)
-        self.refresh_area_labels()
-        self.sync_terror_box_entries()
-        self.terror_status.configure(text="Terror radius area coordinates applied.")
-        self.log(f"Terror radius area set from coordinates: {box}")
         return True
 
     def apply_timing_settings(self):
@@ -3837,35 +3834,86 @@ class App:
 
     def skill_box_summary(self):
         skill = self.cfg.get("skillCheck") or {}
-        return f"Skill-check box: {self.format_box(skill.get('box'))}\nInput: {skill.get('pressKey') or 'c'}\nHit window: {skill.get('hitDepthPercent', DEFAULT_CONFIG['skillCheck']['hitDepthPercent'])}-{skill.get('hitWindowEndPercent', DEFAULT_CONFIG['skillCheck']['hitWindowEndPercent'])}%"
-
-    def terror_box_summary(self):
-        terror = self.cfg.get("terrorRadius") or {}
-        return f"Terror-radius box: {self.format_box(terror.get('box'))}\nRadius size: {terror.get('radiusMeters') or 32}m"
+        return f"Skill-check box: {self.format_box(skill.get('box'))}\nInput: {skill.get('pressKey') or 'c'}\nHit rule: red inside white-zone interior"
 
     def refresh_area_labels(self):
         if hasattr(self, "boxes"):
             self.boxes.configure(text=self.box_summary())
         if hasattr(self, "skill_box_label"):
             self.skill_box_label.configure(text=self.skill_box_summary())
-        if hasattr(self, "terror_box_label"):
-            self.terror_box_label.configure(text=self.terror_box_summary())
+        self.render_home_state()
 
-    def sync_terror_box_entries(self):
-        if not hasattr(self, "terror_box_entries"):
+    def render_home_state(self):
+        if not hasattr(self, "home_map_status"):
             return
-        box = self.cfg["terrorRadius"].get("box") or DEFAULT_CONFIG["terrorRadius"]["box"]
-        for key, meta in self.terror_box_entries.items():
-            entry = meta["entry"]
-            entry.delete(0, END)
-            entry.insert(0, str(int(box.get(key, meta["minimum"]))))
+        map_running = bool(self.cfg.get("mapDetectorEnabled"))
+        skill_cfg = self.cfg.get("skillCheck") or {}
+        skill_running = bool(skill_cfg.get("enabled"))
+        overlay_cfg = self.cfg.get("overlay") or {}
+        overlay_enabled = bool(overlay_cfg.get("enabled"))
+        overlay_position = overlay_cfg.get("position") or ("top-left" if overlay_cfg.get("side") == "left" else "top-right")
+        if hasattr(self, "map_enabled_var"):
+            self.map_enabled_var.set(map_running)
+        if hasattr(self, "skill_enabled_var"):
+            self.skill_enabled_var.set(skill_running)
+        if hasattr(self, "overlay_enabled_var"):
+            self.overlay_enabled_var.set(overlay_enabled)
+        if hasattr(self, "overlay_drag_var"):
+            self.overlay_drag_var.set(bool(overlay_cfg.get("dragMode")))
+
+        map_text = "Watching" if map_running else "Off"
+        if self.current_match:
+            map_text = f"Matched: {self.current_match['name']}"
+        self.home_map_status.configure(text=map_text, fg=self.COLORS["accent2"] if map_running or self.current_match else self.COLORS["text"])
+        self.home_map_detail.configure(
+            text=(
+                f"Trigger: {self.format_box(self.cfg.get('imageTriggerBox'))}\n"
+                f"Text: {self.format_box(self.cfg.get('textBox'))}"
+            )
+        )
+
+        skill_input = skill_cfg.get("pressKey") or "c"
+        self.home_skill_status.configure(text="Watching" if skill_running else "Off", fg=self.COLORS["accent2"] if skill_running else self.COLORS["text"])
+        self.home_skill_detail.configure(
+            text=(
+                f"Area: {self.format_box(skill_cfg.get('box'))}\n"
+                f"Input: {skill_input}"
+            )
+        )
+
+        map_name = self.current_match["name"] if self.current_match else self.selected_map_name or "none"
+        overlay_state = "On" if overlay_enabled else "Off"
+        mouse_state = "drag mode" if overlay_cfg.get("dragMode") else "click-through"
+        self.home_overlay_status.configure(
+            text=(
+                f"Overlay: {overlay_state}\n"
+                f"Position: {overlay_position.replace('-', ' ').title()}\n"
+                f"Mouse: {mouse_state}\n"
+                f"Map: {map_name}"
+            )
+        )
+        if hasattr(self, "home_current_map"):
+            self.home_current_map.configure(text=map_name if map_name != "none" else "No map selected")
+            if self.current_match:
+                current_detail = f"Detected with score {self.current_match.get('score', 0):.2f}"
+            else:
+                image_count = len(getattr(self, "selected_image_paths", []) or [])
+                current_detail = f"Selected manually. {image_count} image{'s' if image_count != 1 else ''} loaded."
+            self.home_current_map_detail.configure(text=current_detail)
 
     def log(self, message):
         log_to_file(message)
-        self.log_box.configure(state="normal")
-        self.log_box.insert("1.0", f"[{time.strftime('%H:%M:%S')}] {message}\n")
-        self.log_box.delete("220.0", END)
-        self.log_box.configure(state="disabled")
+        line = f"[{time.strftime('%H:%M:%S')}] {message}\n"
+        if hasattr(self, "log_box"):
+            self.log_box.configure(state="normal")
+            self.log_box.insert("1.0", line)
+            self.log_box.delete("220.0", END)
+            self.log_box.configure(state="disabled")
+        if hasattr(self, "home_activity"):
+            self.home_activity.configure(state="normal")
+            self.home_activity.insert("1.0", line)
+            self.home_activity.delete("160.0", END)
+            self.home_activity.configure(state="disabled")
 
     def start_detection(self):
         self.apply_timing_settings()
@@ -3874,6 +3922,7 @@ class App:
         self.set_pill(self.run_pill, "Map: watching", "watch")
         self.status.configure(text="Waiting for trigger image.")
         self.detector.start()
+        self.render_home_state()
 
     def stop_detection(self):
         self.cfg["mapDetectorEnabled"] = False
@@ -3881,6 +3930,7 @@ class App:
         self.detector.stop()
         self.set_pill(self.run_pill, "Map: off", "stop")
         self.status.configure(text="Stopped.")
+        self.render_home_state()
 
     def start_skill_checks(self):
         self.apply_skill_settings()
@@ -3889,11 +3939,12 @@ class App:
         self.set_pill(self.skill_pill, "Watching", "watch")
         self.set_pill(self.skill_global_pill, "Skill: on", "watch")
         self.set_pill(self.skill_white_pill, "White: no", "stop")
-        self.set_pill(self.skill_zone_pill, "Zones: 0/0", "stop")
+        self.set_pill(self.skill_zone_pill, "Markers: 0", "stop")
         self.set_pill(self.skill_red_pill, "Red in zone: no", "stop")
         self.set_pill(self.skill_hit_pill, "Hit: no", "stop")
         self.skill_status.configure(text="Watching skill-check area.")
         self.skill_detector.start()
+        self.render_home_state()
 
     def stop_skill_checks(self):
         self.cfg["skillCheck"]["enabled"] = False
@@ -3903,37 +3954,13 @@ class App:
         self.set_pill(self.skill_pill, "Stopped", "stop")
         self.set_pill(self.skill_global_pill, "Skill: off", "stop")
         self.set_pill(self.skill_white_pill, "White: no", "stop")
-        self.set_pill(self.skill_zone_pill, "Zones: 0/0", "stop")
+        self.set_pill(self.skill_zone_pill, "Markers: 0", "stop")
         self.set_pill(self.skill_red_pill, "Red in zone: no", "stop")
         self.set_pill(self.skill_hit_pill, "Hit: no", "stop")
         self.skill_preview_photo = None
         self.skill_preview.configure(image="", text="Live preview will appear while watching.")
         self.skill_status.configure(text="Stopped.")
-
-    def start_terror_radius(self):
-        self.apply_terror_settings()
-        self.cfg["terrorRadius"]["enabled"] = True
-        save_config(self.cfg)
-        self.set_pill(self.terror_pill, "Watching", "watch")
-        self.set_pill(self.terror_global_pill, "Terror: on", "watch")
-        self.set_pill(self.terror_detect_pill, "Heart: no", "stop")
-        self.set_pill(self.terror_layer_pill, "Layer: --", "stop")
-        self.set_pill(self.terror_beat_pill, "Beat: --", "stop")
-        self.terror_status.configure(text="Watching visual heartbeat area.")
-        self.terror_detector.start()
-
-    def stop_terror_radius(self):
-        self.cfg["terrorRadius"]["enabled"] = False
-        save_config(self.cfg)
-        self.terror_detector.stop()
-        self.set_pill(self.terror_pill, "Stopped", "stop")
-        self.set_pill(self.terror_global_pill, "Terror: off", "stop")
-        self.set_pill(self.terror_detect_pill, "Heart: no", "stop")
-        self.set_pill(self.terror_layer_pill, "Layer: --", "stop")
-        self.set_pill(self.terror_beat_pill, "Beat: --", "stop")
-        self.terror_preview_photo = None
-        self.terror_preview.configure(image="", text="Live preview will appear while watching.")
-        self.terror_status.configure(text="Stopped.")
+        self.render_home_state()
 
     def toggle_skill_debug_overlay(self):
         skill = self.cfg["skillCheck"]
@@ -4036,11 +4063,13 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def process_events(self):
+        handled_event = False
         while True:
             try:
                 kind, payload = self.events.get_nowait()
             except queue.Empty:
                 break
+            handled_event = True
             if kind == "log":
                 self.log(payload)
             elif kind == "state":
@@ -4080,21 +4109,21 @@ class App:
                         pass
                 if overlay_rgba and overlay_box and width > 0 and height > 0:
                     self.skill_debug_overlay.update(overlay_box, overlay_rgba, width, height)
-                self.set_pill(self.skill_white_pill, f"White: {'seen' if armed else 'no'} ({memory})", "good" if armed else "stop")
+                self.set_pill(self.skill_white_pill, f"White: {'seen' if armed else 'no'}", "good" if armed else "stop")
                 zone_kind = "good" if zones and hit_zones >= zones else "warn" if zones else "stop"
-                self.set_pill(self.skill_zone_pill, f"Zones: {hit_zones}/{zones}", zone_kind)
-                self.set_pill(self.skill_global_pill, f"Skill: on {hit_zones}/{zones}", "watch" if zones else "watch")
-                self.set_pill(self.skill_red_pill, f"Red in zone: {red_in_zone}", "warn" if red_in_zone else "stop")
+                self.set_pill(self.skill_zone_pill, f"Markers: {zones}", zone_kind)
+                self.set_pill(self.skill_global_pill, f"Skill: on {zones}", "watch")
+                self.set_pill(self.skill_red_pill, f"Red in target: {red_in_zone}", "warn" if red_in_zone else "stop")
                 hit_text = "Hit: SENT" if hit else "Hit: cooldown" if cooldown else "Hit: no"
                 self.set_pill(self.skill_hit_pill, hit_text, "good" if hit else "warn" if cooldown else "stop")
                 if hit:
-                    self.skill_status.configure(text=f"NOW: sent input; zones {hit_zones}/{zones}; red in white {red_in_zone}.")
+                    self.skill_status.configure(text=f"NOW: sent input; red inside target {red_in_zone}; markers {zones}.")
                 elif cooldown:
-                    self.skill_status.configure(text=f"NOW: red in an already-hit white zone ({red_in_zone}); zones {hit_zones}/{zones}.")
+                    self.skill_status.configure(text=f"NOW: red still inside the same marker ({red_in_zone}); waiting to re-arm.")
                 elif armed and red_in_zone:
-                    self.skill_status.configure(text=f"NOW: red fully inside a valid white zone ({red_in_zone}); zones {hit_zones}/{zones}.")
+                    self.skill_status.configure(text=f"NOW: red inside target ({red_in_zone}); markers {zones}.")
                 elif armed:
-                    self.skill_status.configure(text=f"NOW: found {zones} valid white zone{'s' if zones != 1 else ''}; hit {hit_zones}; red in zone 0; total red {red_total}.")
+                    self.skill_status.configure(text=f"NOW: found {zones} marker{'s' if zones != 1 else ''}; red in target 0; total red {red_total}.")
                 else:
                     self.skill_status.configure(text=f"NOW: watching; looking for a big enough white success zone; total red {red_total}.")
             elif kind == "skill-hit":
@@ -4111,44 +4140,6 @@ class App:
                 else:
                     self.skill_status.configure(text=f"Input failed: {payload.get('message')}")
                     self.log(f"Skill check input failed: {payload.get('message')}")
-            elif kind == "terror-state":
-                self.terror_status.configure(text=payload)
-                if "detected" in payload or "Watching" in payload:
-                    self.set_pill(self.terror_pill, "Watching", "watch")
-                    self.set_pill(self.terror_global_pill, "Terror: on", "watch")
-            elif kind == "terror-score":
-                self.terror_score.configure(text=payload)
-            elif kind == "terror-visual":
-                detected = bool(payload.get("detected"))
-                strings_seen = bool(payload.get("stringsSeen"))
-                beat = bool(payload.get("beat"))
-                layer = payload.get("layer") or "--"
-                strength = float(payload.get("strength") or 0)
-                bpm = int(payload.get("bpm") or 0)
-                distance_label = payload.get("distanceLabel") or "--"
-                string_count = int(payload.get("stringCount") or 0)
-                heart_count = int(payload.get("heartCount") or 0)
-                rgb = payload.get("rgb")
-                width = int(payload.get("width") or 0)
-                height = int(payload.get("height") or 0)
-                if rgb and width > 0 and height > 0:
-                    try:
-                        image = Image.frombytes("RGB", (width, height), rgb)
-                        image.thumbnail((360, 260), Image.Resampling.NEAREST)
-                        self.terror_preview_photo = ImageTk.PhotoImage(image)
-                        self.terror_preview.configure(image=self.terror_preview_photo, text="")
-                    except Exception:
-                        pass
-                self.set_pill(self.terror_detect_pill, f"Heart: {'seen' if detected else 'no'} ({heart_count})", "good" if detected else "stop")
-                self.set_pill(self.terror_layer_pill, f"Strings: {string_count}", "warn" if strings_seen else "stop")
-                beat_text = f"Beat: {bpm} bpm" if bpm else "Beat: yes" if beat else "Beat: --"
-                self.set_pill(self.terror_beat_pill, beat_text, "good" if beat else "stop")
-                if detected and strings_seen:
-                    self.terror_status.configure(text=f"Terror radius {layer.lower()}: {distance_label} | intensity {strength:.2f}.")
-                elif detected:
-                    self.terror_status.configure(text=f"Heart tracked; waiting for strings | intensity {strength:.2f}.")
-                else:
-                    self.terror_status.configure(text=f"No visual heartbeat detected | intensity {strength:.2f}.")
             elif kind == "ocr":
                 self.set_text(self.ocr, payload)
             elif kind == "match":
@@ -4163,6 +4154,7 @@ class App:
                     self.suppress_overlay_updates = False
                 self.update_overlay(force_recreate=True)
                 self.render_overlay_state()
+                self.render_home_state()
             elif kind == "ocr-install":
                 self.installing_ocr = False
                 if payload.get("ok"):
@@ -4175,6 +4167,8 @@ class App:
                 else:
                     self.log(f"OCR install failed: {payload.get('message') or 'unknown error'}")
                     self.status.configure(text="OCR install failed. Check the log.")
+        if handled_event:
+            self.render_home_state()
         self.root.after(50, self.process_events)
 
     def render_map_view(self):
@@ -4187,6 +4181,7 @@ class App:
             self.image_count_label.configure(text="")
             self.image_list.delete(0, END)
             self.map_image.configure(image="", text="No local map image loaded yet.")
+            self.render_home_state()
             return
 
         library_entry = self.selected_library_entry()
@@ -4218,6 +4213,7 @@ class App:
             self.map_image.configure(image="", text=f"No local image found for {entry['name']}.")
             if not self.suppress_overlay_updates:
                 self.update_overlay()
+        self.render_home_state()
 
     def render_selected_map_image(self):
         if not self.selected_image_paths:
@@ -4225,6 +4221,7 @@ class App:
             self.map_image.configure(image="", text="No local map image loaded yet.")
             if not self.suppress_overlay_updates:
                 self.update_overlay()
+            self.render_home_state()
             return
         image_path = self.selected_image_paths[self.selected_image_index]
         try:
@@ -4234,9 +4231,11 @@ class App:
             self.map_image.configure(image=self.map_photo, text="")
             if not self.suppress_overlay_updates:
                 self.update_overlay()
+            self.render_home_state()
         except Exception as exc:
             self.map_photo = None
             self.map_image.configure(image="", text=f"Could not load map image: {exc}")
+            self.render_home_state()
 
     def select_map_by_name(self, map_name):
         for index, entry in enumerate(self.map_library_entries):
@@ -4317,15 +4316,17 @@ class App:
 
     def toggle_overlay(self):
         self.cfg["overlay"]["enabled"] = not bool(self.cfg["overlay"].get("enabled"))
-        save_config(self.cfg)
+        save_config(self.cfg, force_overlay=True)
         self.update_overlay()
         self.render_overlay_state()
+        self.render_home_state()
 
     def toggle_overlay_drag_mode(self):
         self.cfg["overlay"]["dragMode"] = not bool(self.cfg["overlay"].get("dragMode"))
-        save_config(self.cfg)
+        save_config(self.cfg, force_overlay=True)
         self.update_overlay()
         self.render_overlay_state()
+        self.render_home_state()
 
     def set_overlay_position(self, position):
         allowed = {"top-left", "top-right", "bottom-left", "bottom-right"}
@@ -4334,9 +4335,10 @@ class App:
         self.cfg["overlay"]["customPosition"] = False
         self.cfg["overlay"]["customX"] = None
         self.cfg["overlay"]["customY"] = None
-        save_config(self.cfg)
+        save_config(self.cfg, force_overlay=True)
         self.update_overlay(force_recreate=True)
         self.render_overlay_state()
+        self.render_home_state()
 
     def select_area(self, kind, frozen=False):
         if self.area_selector_open:
@@ -4356,7 +4358,7 @@ class App:
             height = self.root.winfo_screenheight()
             selector_scope = "screen"
         frozen_photo = None
-        freeze_screen = frozen or kind in {"trigger", "text", "terror"}
+        freeze_screen = frozen or kind in {"trigger", "text"}
         if freeze_screen:
             try:
                 with mss.MSS() as sct:
@@ -4368,13 +4370,10 @@ class App:
 
         self.detector.stop()
         self.skill_detector.stop()
-        self.terror_detector.stop()
         self.skill_debug_overlay.close()
         self.set_pill(self.run_pill, "Map: off", "stop")
         self.set_pill(self.skill_global_pill, "Skill: off", "stop")
-        self.set_pill(self.terror_global_pill, "Terror: off", "stop")
         self.set_pill(self.skill_pill, "Stopped", "stop")
-        self.set_pill(self.terror_pill, "Stopped", "stop")
         selector = Toplevel(self.root)
         selector.overrideredirect(True)
         selector.attributes("-topmost", True)
@@ -4403,7 +4402,6 @@ class App:
                 "trigger": "Drag around the trigger image.",
                 "text": "Drag around the OCR text area.",
                 "skill": "Frozen screen: drag around the skill-check circle.",
-                "terror": "Drag around the visual heartbeat.",
             }.get(kind, "Drag around the area.") + f" ({selector_scope})",
             bg="#000000",
             fg="#ffffff",
@@ -4457,12 +4455,6 @@ class App:
                 save_config(self.cfg)
                 self.refresh_area_labels()
                 self.log(f"Skill check area applied: {stored_box}")
-            elif kind == "terror":
-                self.cfg["terrorRadius"]["box"] = stored_box
-                save_config(self.cfg)
-                self.refresh_area_labels()
-                self.sync_terror_box_entries()
-                self.log(f"Terror radius area applied: {stored_box}")
 
         def apply_selection():
             box = pending["box"]
@@ -4475,6 +4467,17 @@ class App:
 
         self.button(confirm_buttons, "Apply", apply_selection, "primary").pack(side="left", padx=(0, 8))
         self.button(confirm_buttons, "Cancel", cancel_selection, "danger").pack(side="left")
+
+        def event_is_on_confirm_panel(event):
+            widget = getattr(event, "widget", None)
+            while widget:
+                if widget == confirm_panel:
+                    return True
+                try:
+                    widget = widget.master
+                except Exception:
+                    return False
+            return False
 
         def show_confirmation(box):
             pending["box"] = box
@@ -4489,6 +4492,8 @@ class App:
             hint.configure(text="Review the selected area, then Apply or Cancel.")
 
         def start_drag(event):
+            if event_is_on_confirm_panel(event):
+                return "break"
             if pending["box"]:
                 pending["box"] = None
                 confirm_panel.place_forget()
@@ -4499,10 +4504,14 @@ class App:
             hint.configure(text="Drag to resize the blue area, then release.")
 
         def update_drag(event):
+            if event_is_on_confirm_panel(event):
+                return "break"
             if drag["active"] and drag["start"]:
                 draw(drag["start"], (event.x_root, event.y_root))
 
         def finish_drag(event):
+            if event_is_on_confirm_panel(event):
+                return "break"
             if not drag["active"] or not drag["start"]:
                 return
             drag["active"] = False
@@ -4545,7 +4554,6 @@ class App:
     def on_close(self):
         self.detector.stop()
         self.skill_detector.stop()
-        self.terror_detector.stop()
         self.skill_debug_overlay.close()
         self.overlay.close()
         self.root.destroy()
