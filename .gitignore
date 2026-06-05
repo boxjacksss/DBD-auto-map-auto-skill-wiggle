@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local/editor files
+.idea/
+.vscode/
+*.log
+*.tmp
+
+# Generated detector assets
+assets/image-trigger-template.png
+assets/debug-image-trigger-current.png
+assets/debug-text-area.png
+assets/debug-text-area-processed.png
+assets/ocr-debug/
+assets/skill-check-debug/
+assets/map-original-backups/
+
+# Build/archive output
+dist/
+build/
+*.zip

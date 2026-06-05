@@ -107,6 +107,10 @@ DEFAULT_CONFIG = {
         "customX": None,
         "customY": None,
     },
+    "autoSprint": {
+        "enabled": False,
+        "dbdOnly": True,
+    },
 }
 
 MAPS = [
@@ -249,6 +253,27 @@ def find_dbd_window_bounds():
         return None
 
 
+def is_dbd_foreground_window():
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return False
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        normalized = buffer.value.strip().lower().replace(" ", "")
+        return any(hint.replace(" ", "") in normalized for hint in DBD_WINDOW_TITLE_HINTS)
+    except Exception:
+        return False
+
+
 def point_in_box(x, y, box):
     return box["x"] <= x <= box["x"] + box["width"] and box["y"] <= y <= box["y"] + box["height"]
 
@@ -314,6 +339,11 @@ def load_config():
         overlay["position"] = "top-left" if overlay.get("side") == "left" else "top-right"
     overlay["side"] = "left" if "left" in overlay["position"] else "right"
     cfg["overlay"] = overlay
+    auto_sprint = cfg.get("autoSprint") or {}
+    auto_sprint_defaults = DEFAULT_CONFIG["autoSprint"]
+    auto_sprint["enabled"] = bool(auto_sprint.get("enabled", auto_sprint_defaults["enabled"]))
+    auto_sprint["dbdOnly"] = bool(auto_sprint.get("dbdOnly", auto_sprint_defaults["dbdOnly"]))
+    cfg["autoSprint"] = auto_sprint
     skill = cfg.get("skillCheck") or {}
     defaults = DEFAULT_CONFIG["skillCheck"]
 
@@ -822,26 +852,45 @@ def activate_windows_input(input_name):
     mouse_inputs = {
         "mouse1": (0x0002, 0x0004, 0),
         "m1": (0x0002, 0x0004, 0),
+        "mb1": (0x0002, 0x0004, 0),
+        "button1": (0x0002, 0x0004, 0),
         "left": (0x0002, 0x0004, 0),
+        "lmb": (0x0002, 0x0004, 0),
         "leftclick": (0x0002, 0x0004, 0),
         "left click": (0x0002, 0x0004, 0),
         "mouse2": (0x0008, 0x0010, 0),
         "m2": (0x0008, 0x0010, 0),
+        "mb2": (0x0008, 0x0010, 0),
+        "button2": (0x0008, 0x0010, 0),
         "right": (0x0008, 0x0010, 0),
+        "rmb": (0x0008, 0x0010, 0),
         "rightclick": (0x0008, 0x0010, 0),
         "right click": (0x0008, 0x0010, 0),
         "mouse3": (0x0020, 0x0040, 0),
         "m3": (0x0020, 0x0040, 0),
+        "mb3": (0x0020, 0x0040, 0),
+        "button3": (0x0020, 0x0040, 0),
         "middle": (0x0020, 0x0040, 0),
+        "mmb": (0x0020, 0x0040, 0),
         "middleclick": (0x0020, 0x0040, 0),
         "middle click": (0x0020, 0x0040, 0),
         "mouse4": (0x0080, 0x0100, 0x0001),
         "m4": (0x0080, 0x0100, 0x0001),
+        "mb4": (0x0080, 0x0100, 0x0001),
+        "button4": (0x0080, 0x0100, 0x0001),
         "x1": (0x0080, 0x0100, 0x0001),
+        "xbutton1": (0x0080, 0x0100, 0x0001),
+        "side1": (0x0080, 0x0100, 0x0001),
+        "side mouse 1": (0x0080, 0x0100, 0x0001),
         "back": (0x0080, 0x0100, 0x0001),
         "mouse5": (0x0080, 0x0100, 0x0002),
         "m5": (0x0080, 0x0100, 0x0002),
+        "mb5": (0x0080, 0x0100, 0x0002),
+        "button5": (0x0080, 0x0100, 0x0002),
         "x2": (0x0080, 0x0100, 0x0002),
+        "xbutton2": (0x0080, 0x0100, 0x0002),
+        "side2": (0x0080, 0x0100, 0x0002),
+        "side mouse 2": (0x0080, 0x0100, 0x0002),
         "forward": (0x0080, 0x0100, 0x0002),
     }
     if value in mouse_inputs:
@@ -854,6 +903,169 @@ def activate_windows_input(input_name):
     scan = user32.MapVirtualKeyW(vk, 0)
     user32.keybd_event(vk, scan, 0, 0)
     user32.keybd_event(vk, scan, 0x0002, 0)
+
+
+def set_windows_key_state(input_name, pressed):
+    if os.name != "nt":
+        raise RuntimeError("Windows input is only supported on Windows.")
+    user32 = windows_user32()
+    vk = windows_virtual_key(input_name)
+    scan = user32.MapVirtualKeyW(vk, 0)
+    flags = 0 if pressed else 0x0002
+    user32.keybd_event(vk, scan, flags, 0)
+
+
+class AutoSprintController:
+    SHIFT_VKS = {0x10, 0xA0, 0xA1}
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    WM_SYSKEYDOWN = 0x0104
+    WM_SYSKEYUP = 0x0105
+    WH_KEYBOARD_LL = 13
+    LLKHF_INJECTED = 0x10
+
+    def __init__(self, cfg, emit):
+        self.cfg = cfg
+        self.emit = emit
+        self.enabled = False
+        self.synthetic_shift_down = False
+        self.physical_shift_down = False
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.hook = None
+        self.callback_ref = None
+        self.user32 = None
+        self.kernel32 = None
+        self.lock = threading.Lock()
+        self.last_focus_state = None
+
+    def log(self, message):
+        self.emit(("log", message))
+
+    def should_hold_shift(self):
+        auto = self.cfg.get("autoSprint") or {}
+        if not bool(auto.get("enabled")):
+            return False
+        if bool(auto.get("dbdOnly", True)) and not is_dbd_foreground_window():
+            return False
+        return not self.physical_shift_down
+
+    def set_shift(self, pressed):
+        if self.synthetic_shift_down == pressed:
+            return
+        try:
+            set_windows_key_state("shift", pressed)
+            self.synthetic_shift_down = pressed
+        except Exception as exc:
+            self.log(f"Auto Sprint input error: {exc}")
+
+    def update_shift_state(self):
+        should_hold = self.should_hold_shift()
+        self.set_shift(should_hold)
+        active = bool((self.cfg.get("autoSprint") or {}).get("enabled"))
+        mode_text = "running" if should_hold else "walking" if self.physical_shift_down else "waiting for DBD focus"
+        if active and self.last_focus_state != mode_text:
+            self.last_focus_state = mode_text
+            self.emit(("auto-sprint-state", mode_text))
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        if os.name != "nt":
+            self.emit(("auto-sprint-state", "Auto Sprint is Windows-only."))
+            return
+        self.stop_event.clear()
+        self.enabled = True
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+        self.log("Auto Sprint started. Shift is held while DBD is focused; hold Shift to walk.")
+
+    def stop(self):
+        self.enabled = False
+        self.stop_event.set()
+        self.physical_shift_down = False
+        self.set_shift(False)
+        self.emit(("auto-sprint-state", "off"))
+        self.log("Auto Sprint stopped.")
+
+    def install_hook(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.user32 = ctypes.windll.user32
+        self.kernel32 = ctypes.windll.kernel32
+
+        class KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("vkCode", wintypes.DWORD),
+                ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p),
+            ]
+
+        hook_proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        self.kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        self.kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        self.kernel32.GetLastError.restype = wintypes.DWORD
+        self.user32.SetWindowsHookExW.argtypes = [ctypes.c_int, hook_proc_type, ctypes.c_void_p, wintypes.DWORD]
+        self.user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        self.user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        self.user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        self.user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        self.user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+
+        @hook_proc_type
+        def hook_proc(n_code, w_param, l_param):
+            if n_code >= 0 and bool((self.cfg.get("autoSprint") or {}).get("enabled")):
+                event = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                is_shift = int(event.vkCode) in self.SHIFT_VKS
+                is_injected = bool(event.flags & self.LLKHF_INJECTED)
+                if is_shift and not is_injected and (not bool((self.cfg.get("autoSprint") or {}).get("dbdOnly", True)) or is_dbd_foreground_window()):
+                    if int(w_param) in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
+                        self.physical_shift_down = True
+                        self.update_shift_state()
+                        return 1
+                    if int(w_param) in (self.WM_KEYUP, self.WM_SYSKEYUP):
+                        self.physical_shift_down = False
+                        self.update_shift_state()
+                        return 1
+            return self.user32.CallNextHookEx(self.hook, n_code, w_param, l_param)
+
+        self.callback_ref = hook_proc
+        module_handle = self.kernel32.GetModuleHandleW(None)
+        self.hook = self.user32.SetWindowsHookExW(self.WH_KEYBOARD_LL, self.callback_ref, module_handle, 0)
+        if not self.hook:
+            self.hook = self.user32.SetWindowsHookExW(self.WH_KEYBOARD_LL, self.callback_ref, None, 0)
+        if not self.hook:
+            error = int(self.kernel32.GetLastError())
+            raise RuntimeError(f"Could not install Auto Sprint keyboard hook. Windows error {error}.")
+
+    def run(self):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            self.install_hook()
+            msg = wintypes.MSG()
+            while not self.stop_event.is_set():
+                self.update_shift_state()
+                while self.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    self.user32.TranslateMessage(ctypes.byref(msg))
+                    self.user32.DispatchMessageW(ctypes.byref(msg))
+                self.stop_event.wait(0.03)
+        except Exception as exc:
+            self.emit(("auto-sprint-state", f"error: {exc}"))
+            self.log(f"Auto Sprint error: {exc}")
+        finally:
+            self.set_shift(False)
+            if self.hook and self.user32:
+                try:
+                    self.user32.UnhookWindowsHookEx(self.hook)
+                except Exception:
+                    pass
+            self.hook = None
+            self.callback_ref = None
 
 
 class SkillCheckDetector:
@@ -2946,6 +3158,7 @@ class App:
         self.events = queue.Queue()
         self.detector = Detector(self.cfg, self.events.put)
         self.skill_detector = SkillCheckDetector(self.cfg, self.events.put)
+        self.auto_sprint = AutoSprintController(self.cfg, self.events.put)
         self.current_match = None
         self.map_library_entries = build_map_library_entries()
         self.selected_map_name = self.map_library_entries[0]["name"] if self.map_library_entries else None
@@ -2957,6 +3170,7 @@ class App:
         self.suppress_overlay_updates = False
         self.area_selector_open = False
         self.selector_photo = None
+        self.auto_sprint_mode = "off"
 
         self.root = Tk()
         self.root.title("DBD Overlay Assistant")
@@ -2966,6 +3180,9 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.map_enabled_var = BooleanVar(value=bool(self.cfg.get("mapDetectorEnabled")))
         self.skill_enabled_var = BooleanVar(value=bool((self.cfg.get("skillCheck") or {}).get("enabled")))
+        auto_sprint_cfg = self.cfg.get("autoSprint") or {}
+        self.auto_sprint_enabled_var = BooleanVar(value=bool(auto_sprint_cfg.get("enabled")))
+        self.auto_sprint_dbd_only_var = BooleanVar(value=bool(auto_sprint_cfg.get("dbdOnly", True)))
         overlay_cfg = self.cfg.get("overlay") or {}
         self.overlay_enabled_var = BooleanVar(value=bool(overlay_cfg.get("enabled")))
         self.overlay_drag_var = BooleanVar(value=bool(overlay_cfg.get("dragMode")))
@@ -2978,6 +3195,8 @@ class App:
         self.update_overlay()
         self.render_overlay_state()
         self.render_home_state()
+        if bool((self.cfg.get("autoSprint") or {}).get("enabled")):
+            self.auto_sprint.start()
         self.log("Using fast Python region capture. Full-screen screenshots are not used while watching.")
         self.log(f"Trigger polling: {self.cfg['scanMs']} ms search, {self.cfg['triggerSeenScanMs']} ms disappearance check.")
         if self.detector.tesseract:
@@ -3045,6 +3264,7 @@ class App:
         self.home_tab = Frame(self.content, bg=self.COLORS["bg"])
         self.detector_tab = Frame(self.content, bg=self.COLORS["bg"])
         self.skill_tab = Frame(self.content, bg=self.COLORS["bg"])
+        self.auto_sprint_tab = Frame(self.content, bg=self.COLORS["bg"])
         self.map_tab = Frame(self.content, bg=self.COLORS["bg"])
         self.overlay_tab = Frame(self.content, bg=self.COLORS["bg"])
         self.timing_tab = Frame(self.content, bg=self.COLORS["bg"])
@@ -3052,6 +3272,7 @@ class App:
             self.home_tab,
             self.detector_tab,
             self.skill_tab,
+            self.auto_sprint_tab,
             self.map_tab,
             self.overlay_tab,
             self.timing_tab,
@@ -3063,6 +3284,7 @@ class App:
         self.nav_button(nav, "Home", self.home_tab).pack(fill="x", pady=(0, 8))
         self.nav_button(nav, "Setup", self.detector_tab).pack(fill="x", pady=(0, 8))
         self.nav_button(nav, "Skill Monitor", self.skill_tab).pack(fill="x", pady=(0, 8))
+        self.nav_button(nav, "Auto Sprint", self.auto_sprint_tab).pack(fill="x", pady=(0, 8))
         self.nav_button(nav, "Maps", self.map_tab).pack(fill="x", pady=(0, 8))
         self.nav_button(nav, "Overlay", self.overlay_tab).pack(fill="x", pady=(0, 8))
         self.nav_button(nav, "Settings", self.timing_tab).pack(fill="x", pady=(0, 8))
@@ -3073,11 +3295,14 @@ class App:
         self.run_pill = self.pill(sidebar_status, "Map: off", "stop")
         self.run_pill.pack(fill="x", pady=(0, 8))
         self.skill_global_pill = self.pill(sidebar_status, "Skill: off", "stop")
-        self.skill_global_pill.pack(fill="x")
+        self.skill_global_pill.pack(fill="x", pady=(0, 8))
+        self.auto_sprint_global_pill = self.pill(sidebar_status, "Sprint: off", "stop")
+        self.auto_sprint_global_pill.pack(fill="x")
 
         self.build_home_tab()
         self.build_detector_tab()
         self.build_skill_tab()
+        self.build_auto_sprint_tab()
         self.build_map_tab()
         self.build_overlay_tab()
         self.build_timing_tab()
@@ -3122,8 +3347,15 @@ class App:
         self.check_toggle(overlay_card, "Drag mode", self.overlay_drag_var, self.set_overlay_drag_from_toggle).pack(fill="x", pady=(0, 10))
         self.link_button(overlay_card, "Position overlay", lambda: self.show_screen(self.overlay_tab)).pack(anchor="w")
 
+        sprint_card = self.feature_card(body, "Auto Sprint", "Keeps Shift held while DBD is focused; hold Shift to walk.")
+        sprint_card.grid(row=2, column=0, sticky="nsew", padx=(0, 9))
+        self.home_auto_sprint_status = self.feature_state(sprint_card, "Off")
+        self.home_auto_sprint_detail = self.feature_detail(sprint_card, lines=3)
+        self.check_toggle(sprint_card, "Auto sprint enabled", self.auto_sprint_enabled_var, self.set_auto_sprint_from_toggle).pack(fill="x", pady=(0, 8))
+        self.link_button(sprint_card, "Open auto sprint settings", lambda: self.show_screen(self.auto_sprint_tab)).pack(anchor="w")
+
         current_card = self.card(body)
-        current_card.grid(row=2, column=0, sticky="nsew", padx=(0, 9))
+        current_card.grid(row=2, column=1, sticky="nsew", padx=9)
         self.card_title(current_card, "Current Map")
         self.home_current_map = Label(current_card, text="None", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 18, "bold"), anchor="w", justify="left")
         self.home_current_map.pack(fill="x", pady=(10, 6))
@@ -3132,7 +3364,7 @@ class App:
         self.link_button(current_card, "Open map library", lambda: self.show_screen(self.map_tab)).pack(anchor="w", pady=(14, 0))
 
         activity_card = self.card(body)
-        activity_card.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=(9, 0))
+        activity_card.grid(row=2, column=2, sticky="nsew", padx=(9, 0))
         self.card_title(activity_card, "Session Feed")
         self.home_activity = Text(
             activity_card,
@@ -3215,7 +3447,7 @@ class App:
     def feature_card(self, parent, title, text):
         frame = self.card(parent)
         Label(frame, text=title, bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 15, "bold"), anchor="w").pack(fill="x")
-        Label(frame, text=text, bg=self.COLORS["panel"], fg=self.COLORS["muted"], wraplength=260, justify="left", font=("Segoe UI", 9)).pack(fill="x", pady=(5, 14))
+        Label(frame, text=text, bg=self.COLORS["panel"], fg=self.COLORS["muted"], wraplength=180, justify="left", anchor="w", font=("Segoe UI", 9)).pack(fill="x", pady=(5, 14))
         return frame
 
     def feature_state(self, parent, text):
@@ -3277,6 +3509,18 @@ class App:
             self.start_skill_checks()
         else:
             self.stop_skill_checks()
+
+    def set_auto_sprint_from_toggle(self):
+        if self.auto_sprint_enabled_var.get():
+            self.start_auto_sprint()
+        else:
+            self.stop_auto_sprint()
+
+    def set_auto_sprint_scope_from_toggle(self):
+        self.cfg["autoSprint"]["dbdOnly"] = bool(self.auto_sprint_dbd_only_var.get())
+        save_config(self.cfg)
+        self.auto_sprint.update_shift_state()
+        self.render_home_state()
 
     def set_overlay_from_toggle(self):
         desired = bool(self.overlay_enabled_var.get())
@@ -3413,6 +3657,51 @@ class App:
         self.button(setup, "Select Skill Area", lambda: self.select_area("skill", frozen=True), "primary").pack(fill="x", pady=(0, 10))
         self.link_button(setup, "Tune skill detection in Settings", lambda: self.show_screen(self.timing_tab)).pack(anchor="w")
 
+    def build_auto_sprint_tab(self):
+        body = self.scroll_body(self.auto_sprint_tab)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+
+        main = self.card(body)
+        main.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 12))
+        self.card_title(main, "Auto Sprint")
+        self.auto_sprint_status = Label(main, text="Off", bg=self.COLORS["panel"], fg=self.COLORS["text"], font=("Segoe UI", 22, "bold"), anchor="w")
+        self.auto_sprint_status.pack(fill="x", pady=(10, 6))
+        self.auto_sprint_detail = Label(
+            main,
+            text="Shift is held for sprint. Hold Shift yourself to walk.",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            justify="left",
+            wraplength=420,
+            font=("Segoe UI", 11),
+        )
+        self.auto_sprint_detail.pack(fill="x", pady=(0, 18))
+        self.check_toggle(main, "Auto sprint enabled", self.auto_sprint_enabled_var, self.set_auto_sprint_from_toggle).pack(fill="x", pady=(0, 10))
+        self.check_toggle(main, "Only while Dead by Daylight is focused", self.auto_sprint_dbd_only_var, self.set_auto_sprint_scope_from_toggle).pack(fill="x", pady=(0, 14))
+
+        controls = Frame(main, bg=self.COLORS["panel"])
+        controls.pack(fill="x")
+        self.button(controls, "Enable", self.start_auto_sprint, "primary").pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.button(controls, "Disable", self.stop_auto_sprint, "danger").pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        behavior = self.card(body)
+        behavior.grid(row=0, column=1, sticky="nsew", padx=(10, 0), pady=(0, 12))
+        self.card_title(behavior, "Behavior")
+        Label(
+            behavior,
+            text=(
+                "When enabled, the app holds Shift down for you.\n\n"
+                "Press and hold Shift to temporarily release sprint and walk.\n\n"
+                "Release Shift to resume sprinting."
+            ),
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            justify="left",
+            wraplength=420,
+            font=("Segoe UI", 11),
+        ).pack(fill="x", pady=(10, 0))
+
     def build_timing_tab(self):
         body = self.scroll_body(self.timing_tab)
         body.grid_columnconfigure(0, weight=1)
@@ -3453,6 +3742,7 @@ class App:
         skill_right = Frame(skill_grid, bg=self.COLORS["panel"])
         skill_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         self.skill_input_row(skill_left, "Press input", "pressKey", "", "", "")
+        self.skill_press_binding_buttons(skill_left)
         self.skill_input_row(skill_left, "White minimum", "whiteMin", 120, 255, "rgb")
         self.skill_input_row(skill_left, "White spread", "whiteSpreadMax", 10, 160, "rgb")
         self.skill_input_row(skill_left, "White zone size", "minWhitePixels", 1, 200, "px")
@@ -3754,6 +4044,75 @@ class App:
         entry.bind("<Return>", lambda _event: self.apply_skill_settings())
         return entry
 
+    def skill_press_binding_buttons(self, parent):
+        wrapper = Frame(parent, bg=self.COLORS["panel"])
+        wrapper.pack(fill="x", pady=(0, 8))
+        Label(
+            wrapper,
+            text="Quick bindings",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+        bindings = [
+            ("C", "c"),
+            ("Space", "space"),
+            ("M1", "mouse1"),
+            ("M2", "mouse2"),
+            ("M3", "mouse3"),
+            ("M4", "mouse4"),
+            ("M5", "mouse5"),
+        ]
+        rows = [Frame(wrapper, bg=self.COLORS["panel"]), Frame(wrapper, bg=self.COLORS["panel"])]
+        rows[0].pack(fill="x", pady=(0, 5))
+        rows[1].pack(fill="x")
+        for index, (label, value) in enumerate(bindings):
+            row = rows[0] if index < 4 else rows[1]
+            self.button(row, label, lambda next_value=value: self.set_skill_press_key(next_value)).pack(side="left", fill="x", expand=True, padx=(0 if index in (0, 4) else 5, 0))
+        Label(
+            wrapper,
+            text="Mouse 4 and Mouse 5 are the side buttons.",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(6, 0))
+
+    def set_skill_press_key(self, value):
+        value = str(value or "").strip().lower() or DEFAULT_CONFIG["skillCheck"]["pressKey"]
+        self.cfg["skillCheck"]["pressKey"] = value
+        meta = getattr(self, "skill_entries", {}).get("pressKey")
+        if meta:
+            entry = meta["entry"]
+            entry.delete(0, END)
+            entry.insert(0, value)
+        save_config(self.cfg)
+        self.refresh_area_labels()
+        self.render_home_state()
+        self.log(f"Skill check input set to {self.skill_input_display(value)}.")
+
+    def skill_input_display(self, value):
+        labels = {
+            "mouse1": "Mouse 1",
+            "m1": "Mouse 1",
+            "mouse2": "Mouse 2",
+            "m2": "Mouse 2",
+            "mouse3": "Mouse 3",
+            "m3": "Mouse 3",
+            "mouse4": "Mouse 4",
+            "m4": "Mouse 4",
+            "x1": "Mouse 4",
+            "xbutton1": "Mouse 4",
+            "side1": "Mouse 4",
+            "mouse5": "Mouse 5",
+            "m5": "Mouse 5",
+            "x2": "Mouse 5",
+            "xbutton2": "Mouse 5",
+            "side2": "Mouse 5",
+            "space": "Space",
+        }
+        text = str(value or "").strip().lower()
+        return labels.get(text, str(value or "c"))
+
     def apply_skill_settings(self):
         changed = []
         skill = self.cfg["skillCheck"]
@@ -3834,7 +4193,7 @@ class App:
 
     def skill_box_summary(self):
         skill = self.cfg.get("skillCheck") or {}
-        return f"Skill-check box: {self.format_box(skill.get('box'))}\nInput: {skill.get('pressKey') or 'c'}\nHit rule: red inside white-zone interior"
+        return f"Skill-check box: {self.format_box(skill.get('box'))}\nInput: {self.skill_input_display(skill.get('pressKey') or 'c')}\nHit rule: red inside white-zone interior"
 
     def refresh_area_labels(self):
         if hasattr(self, "boxes"):
@@ -3860,6 +4219,12 @@ class App:
             self.overlay_enabled_var.set(overlay_enabled)
         if hasattr(self, "overlay_drag_var"):
             self.overlay_drag_var.set(bool(overlay_cfg.get("dragMode")))
+        auto_sprint_cfg = self.cfg.get("autoSprint") or {}
+        auto_sprint_enabled = bool(auto_sprint_cfg.get("enabled"))
+        if hasattr(self, "auto_sprint_enabled_var"):
+            self.auto_sprint_enabled_var.set(auto_sprint_enabled)
+        if hasattr(self, "auto_sprint_dbd_only_var"):
+            self.auto_sprint_dbd_only_var.set(bool(auto_sprint_cfg.get("dbdOnly", True)))
 
         map_text = "Watching" if map_running else "Off"
         if self.current_match:
@@ -3872,7 +4237,7 @@ class App:
             )
         )
 
-        skill_input = skill_cfg.get("pressKey") or "c"
+        skill_input = self.skill_input_display(skill_cfg.get("pressKey") or "c")
         self.home_skill_status.configure(text="Watching" if skill_running else "Off", fg=self.COLORS["accent2"] if skill_running else self.COLORS["text"])
         self.home_skill_detail.configure(
             text=(
@@ -3900,6 +4265,40 @@ class App:
                 image_count = len(getattr(self, "selected_image_paths", []) or [])
                 current_detail = f"Selected manually. {image_count} image{'s' if image_count != 1 else ''} loaded."
             self.home_current_map_detail.configure(text=current_detail)
+        if hasattr(self, "home_auto_sprint_status"):
+            status = self.auto_sprint_display_text() if auto_sprint_enabled else "Off"
+            self.home_auto_sprint_status.configure(text=status, fg=self.auto_sprint_display_color() if auto_sprint_enabled else self.COLORS["text"])
+            scope = "DBD only" if auto_sprint_cfg.get("dbdOnly", True) else "global"
+            self.home_auto_sprint_detail.configure(text=f"Mode: {scope}\nShift held to sprint\nHold Shift to walk")
+        if hasattr(self, "auto_sprint_status"):
+            self.auto_sprint_status.configure(text=self.auto_sprint_display_text() if auto_sprint_enabled else "Off", fg=self.auto_sprint_display_color() if auto_sprint_enabled else self.COLORS["text"])
+            scope = "only while DBD is focused" if auto_sprint_cfg.get("dbdOnly", True) else "globally"
+            self.auto_sprint_detail.configure(text=f"Shift is held {scope}. Hold Shift yourself to walk.")
+        if hasattr(self, "auto_sprint_global_pill"):
+            if auto_sprint_enabled and self.auto_sprint_mode == "running":
+                self.set_pill(self.auto_sprint_global_pill, "Sprint: running", "good")
+            elif auto_sprint_enabled and self.auto_sprint_mode == "walking":
+                self.set_pill(self.auto_sprint_global_pill, "Sprint: walk", "warn")
+            else:
+                self.set_pill(self.auto_sprint_global_pill, "Sprint: on" if auto_sprint_enabled else "Sprint: off", "watch" if auto_sprint_enabled else "stop")
+
+    def auto_sprint_display_text(self):
+        return {
+            "running": "Sprinting",
+            "walking": "Walking",
+            "waiting for DBD focus": "Waiting",
+            "error": "Error",
+            "off": "Off",
+        }.get(self.auto_sprint_mode, "On")
+
+    def auto_sprint_display_color(self):
+        return {
+            "running": self.COLORS["accent2"],
+            "walking": self.COLORS["warn"],
+            "waiting for DBD focus": self.COLORS["muted"],
+            "error": self.COLORS["danger"],
+            "off": self.COLORS["text"],
+        }.get(self.auto_sprint_mode, self.COLORS["accent2"])
 
     def log(self, message):
         log_to_file(message)
@@ -3960,6 +4359,21 @@ class App:
         self.skill_preview_photo = None
         self.skill_preview.configure(image="", text="Live preview will appear while watching.")
         self.skill_status.configure(text="Stopped.")
+        self.render_home_state()
+
+    def start_auto_sprint(self):
+        self.cfg["autoSprint"]["enabled"] = True
+        self.cfg["autoSprint"]["dbdOnly"] = bool(self.auto_sprint_dbd_only_var.get())
+        save_config(self.cfg)
+        self.auto_sprint_mode = "waiting for DBD focus"
+        self.auto_sprint.start()
+        self.render_home_state()
+
+    def stop_auto_sprint(self):
+        self.cfg["autoSprint"]["enabled"] = False
+        save_config(self.cfg)
+        self.auto_sprint_mode = "off"
+        self.auto_sprint.stop()
         self.render_home_state()
 
     def toggle_skill_debug_overlay(self):
@@ -4140,6 +4554,30 @@ class App:
                 else:
                     self.skill_status.configure(text=f"Input failed: {payload.get('message')}")
                     self.log(f"Skill check input failed: {payload.get('message')}")
+            elif kind == "auto-sprint-state":
+                text = str(payload)
+                self.auto_sprint_mode = text if not text.startswith("error") else "error"
+                if hasattr(self, "auto_sprint_status"):
+                    if text == "off":
+                        self.auto_sprint_status.configure(text="Off", fg=self.COLORS["text"])
+                    elif text.startswith("error"):
+                        self.auto_sprint_status.configure(text="Error", fg=self.COLORS["danger"])
+                    elif text == "walking":
+                        self.auto_sprint_status.configure(text="Walking", fg=self.COLORS["warn"])
+                    elif text == "running":
+                        self.auto_sprint_status.configure(text="Sprinting", fg=self.COLORS["accent2"])
+                    else:
+                        self.auto_sprint_status.configure(text="Waiting", fg=self.COLORS["muted"])
+                if hasattr(self, "auto_sprint_global_pill"):
+                    if text == "running":
+                        self.set_pill(self.auto_sprint_global_pill, "Sprint: running", "good")
+                    elif text == "walking":
+                        self.set_pill(self.auto_sprint_global_pill, "Sprint: walk", "warn")
+                    elif text.startswith("error"):
+                        self.set_pill(self.auto_sprint_global_pill, "Sprint: error", "danger")
+                    else:
+                        enabled = bool((self.cfg.get("autoSprint") or {}).get("enabled"))
+                        self.set_pill(self.auto_sprint_global_pill, "Sprint: on" if enabled else "Sprint: off", "watch" if enabled else "stop")
             elif kind == "ocr":
                 self.set_text(self.ocr, payload)
             elif kind == "match":
@@ -4554,6 +4992,7 @@ class App:
     def on_close(self):
         self.detector.stop()
         self.skill_detector.stop()
+        self.auto_sprint.stop()
         self.skill_debug_overlay.close()
         self.overlay.close()
         self.root.destroy()
