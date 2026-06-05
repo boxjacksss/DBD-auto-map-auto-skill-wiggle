@@ -1,3 +1,5 @@
+No BAN
+
 # DBD Screen OCR Detector
 
 Python-only screen detector for Dead by Daylight map OCR.
